@@ -1,0 +1,15 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests
+      - name: Sandbox selftest
+        run: bin/pi-safe selftest --safe-home "$RUNNER_TEMP/pi-safe"

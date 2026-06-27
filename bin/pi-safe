@@ -1,0 +1,617 @@
+#!/usr/bin/env python3
+"""pi-safe: a harness-owned macOS sandbox launcher for the Pi coding agent."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import difflib
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import textwrap
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable
+
+
+VERSION = "0.1.0"
+MANIFEST = "pi-safe-session.json"
+PROFILE = "pi-safe.sb"
+DEFAULT_EXCLUDES = [".git", ".pi-safe", ".DS_Store"]
+TEXT_DIFF_MAX_BYTES = 1024 * 1024
+
+
+class PiSafeError(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class Session:
+    session_id: str
+    project: Path
+    root: Path
+    original: Path
+    staging: Path
+    writable: Path
+    profile: Path
+
+
+def now_slug() -> str:
+    return _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def default_safe_home() -> Path:
+    return Path(os.environ.get("PI_SAFE_HOME", "~/.pi-safe")).expanduser()
+
+
+def resolve_existing_dir(value: str, label: str) -> Path:
+    path = Path(value).expanduser().resolve()
+    if not path.exists():
+        raise PiSafeError(f"{label} does not exist: {path}")
+    if not path.is_dir():
+        raise PiSafeError(f"{label} is not a directory: {path}")
+    return path
+
+
+def resolve_safe_home(value: str | None) -> Path:
+    return Path(value).expanduser().resolve() if value else default_safe_home().resolve()
+
+
+def is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def rel_to(base: Path, path: Path) -> str:
+    rel = path.relative_to(base)
+    if rel.is_absolute() or ".." in rel.parts:
+        raise PiSafeError(f"unsafe relative path: {rel}")
+    return rel.as_posix()
+
+
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def write_json(path: Path, data: dict[str, Any]) -> None:
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def quote_sb(value: Path | str) -> str:
+    raw = str(value)
+    return '"' + raw.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def make_profile(staging: Path, writable: Path, allow_system_temp: bool = False) -> str:
+    writable_paths = [
+        staging,
+        writable,
+    ]
+    if allow_system_temp:
+        writable_paths.extend([Path("/private/tmp"), Path("/tmp")])
+    allow_lines = "\n".join(f"  (subpath {quote_sb(path)})" for path in writable_paths)
+    return textwrap.dedent(
+        f"""\
+        (version 1)
+        (allow default)
+        (deny file-write*)
+        (allow file-write*
+        {allow_lines}
+        )
+        """
+    )
+
+
+def safe_copytree(src: Path, dest: Path, excludes: list[str]) -> None:
+    if dest.exists():
+        raise PiSafeError(f"refusing to overwrite existing copy destination: {dest}")
+    ignore = shutil.ignore_patterns(*excludes) if excludes else None
+    shutil.copytree(src, dest, symlinks=True, ignore=ignore)
+
+
+def create_session(
+    project: Path,
+    safe_home: Path,
+    session_name: str | None,
+    excludes: list[str],
+    allow_system_temp: bool,
+) -> Session:
+    project_slug = project.name or "project"
+    session_id = session_name or f"{now_slug()}-{project_slug}-{uuid.uuid4().hex[:8]}"
+    root = safe_home / "sessions" / session_id
+    if root.exists():
+        raise PiSafeError(f"session already exists: {session_id}")
+
+    original = root / "original"
+    staging = root / "staging"
+    writable = root / "writable"
+    profile = root / PROFILE
+    ensure_dir(root)
+    ensure_dir(writable)
+    ensure_dir(writable / "home")
+    ensure_dir(writable / "tmp")
+    ensure_dir(writable / "pi-agent")
+    ensure_dir(writable / "pi-sessions")
+    ensure_dir(root / "logs")
+
+    safe_copytree(project, original, excludes)
+    safe_copytree(project, staging, excludes)
+    profile.write_text(make_profile(staging, writable, allow_system_temp), encoding="utf-8")
+
+    session = Session(session_id, project, root, original, staging, writable, profile)
+    write_json(
+        root / MANIFEST,
+        {
+            "version": 1,
+            "sessionId": session_id,
+            "createdAt": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "project": str(project),
+            "original": str(original),
+            "staging": str(staging),
+            "writable": str(writable),
+            "profile": str(profile),
+            "excludes": excludes,
+            "allowSystemTemp": allow_system_temp,
+        },
+    )
+    return session
+
+
+def load_session(safe_home: Path, session_id: str) -> Session:
+    root = safe_home / "sessions" / session_id
+    manifest_path = root / MANIFEST
+    if not manifest_path.exists():
+        raise PiSafeError(f"session not found: {session_id}")
+    data = read_json(manifest_path)
+    return Session(
+        session_id=data["sessionId"],
+        project=Path(data["project"]).expanduser().resolve(),
+        root=root,
+        original=Path(data["original"]).expanduser().resolve(),
+        staging=Path(data["staging"]).expanduser().resolve(),
+        writable=Path(data["writable"]).expanduser().resolve(),
+        profile=Path(data["profile"]).expanduser().resolve(),
+    )
+
+
+def find_pi(explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    found = shutil.which("pi")
+    if not found:
+        raise PiSafeError("could not find `pi` on PATH; pass --pi /path/to/pi")
+    return found
+
+
+def run_sandboxed_pi(session: Session, pi_cmd: str, pi_args: list[str]) -> int:
+    sandbox = shutil.which("sandbox-exec") or "/usr/bin/sandbox-exec"
+    if not Path(sandbox).exists():
+        raise PiSafeError("sandbox-exec not found; this launcher currently requires macOS Seatbelt")
+
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(session.writable / "home"),
+            "TMPDIR": str(session.writable / "tmp"),
+            "TMP": str(session.writable / "tmp"),
+            "TEMP": str(session.writable / "tmp"),
+            "PI_CODING_AGENT_DIR": str(session.writable / "pi-agent"),
+            "PI_CODING_AGENT_SESSION_DIR": str(session.writable / "pi-sessions"),
+        }
+    )
+
+    cmd = [sandbox, "-f", str(session.profile), pi_cmd, *pi_args]
+    print(f"pi-safe session: {session.session_id}")
+    print(f"real project:    {session.project}")
+    print(f"staging project: {session.staging}")
+    print(f"profile:         {session.profile}")
+    print()
+    return subprocess.run(cmd, cwd=session.staging, env=env).returncode
+
+
+def iter_entries(base: Path) -> Iterable[Path]:
+    stack = [base]
+    while stack:
+        current = stack.pop()
+        for entry in sorted(os.scandir(current), key=lambda e: e.name):
+            path = Path(entry.path)
+            if entry.is_symlink():
+                yield path
+            elif entry.is_dir(follow_symlinks=False):
+                stack.append(path)
+            elif entry.is_file(follow_symlinks=False):
+                yield path
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def file_map(base: Path) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for path in iter_entries(base):
+        rel = rel_to(base, path)
+        st = path.lstat()
+        if path.is_symlink():
+            out[rel] = {"type": "symlink", "target": os.readlink(path), "mode": st.st_mode}
+        else:
+            out[rel] = {"type": "file", "sha256": sha256_file(path), "size": st.st_size, "mode": st.st_mode}
+    return out
+
+
+def change_set(original: Path, staging: Path) -> list[dict[str, Any]]:
+    left = file_map(original)
+    right = file_map(staging)
+    changes: list[dict[str, Any]] = []
+    for rel in sorted(left.keys() | right.keys()):
+        before = left.get(rel)
+        after = right.get(rel)
+        if before is None:
+            changes.append({"kind": "added", "path": rel, "after": after})
+        elif after is None:
+            changes.append({"kind": "deleted", "path": rel, "before": before})
+        elif before != after:
+            if before["type"] != after["type"]:
+                kind = "type_changed"
+            else:
+                kind = "modified"
+            changes.append({"kind": kind, "path": rel, "before": before, "after": after})
+    return changes
+
+
+def read_text_for_diff(path: Path) -> list[str] | None:
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return []
+    if len(data) > TEXT_DIFF_MAX_BYTES or b"\0" in data:
+        return None
+    try:
+        return data.decode("utf-8").splitlines(keepends=True)
+    except UnicodeDecodeError:
+        return None
+
+
+def print_diff(session: Session) -> int:
+    changes = change_set(session.original, session.staging)
+    if not changes:
+        print("No staged changes.")
+        return 0
+    print(f"{len(changes)} staged change(s):")
+    for change in changes:
+        print(f"- {change['kind']}: {change['path']}")
+    print()
+    for change in changes:
+        rel = change["path"]
+        before_path = session.original / rel
+        after_path = session.staging / rel
+        if change["kind"] == "deleted":
+            before = read_text_for_diff(before_path)
+            after: list[str] | None = []
+        elif change["kind"] == "added":
+            before = []
+            after = read_text_for_diff(after_path)
+        elif change.get("before", {}).get("type") == "file" and change.get("after", {}).get("type") == "file":
+            before = read_text_for_diff(before_path)
+            after = read_text_for_diff(after_path)
+        else:
+            before = after = None
+        if before is None or after is None:
+            print(f"Binary or non-text change: {rel}")
+            continue
+        sys.stdout.writelines(
+            difflib.unified_diff(
+                before,
+                after,
+                fromfile=f"original/{rel}",
+                tofile=f"staging/{rel}",
+            )
+        )
+        if before or after:
+            print()
+    return 1
+
+
+def has_symlink_parent(root: Path, rel: str) -> bool:
+    current = root
+    parts = Path(rel).parts[:-1]
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def find_trash() -> str | None:
+    return shutil.which("trash") or ("/usr/bin/trash" if Path("/usr/bin/trash").exists() else None)
+
+
+def guard_apply(session: Session, changes: list[dict[str, Any]], allow_symlinks: bool) -> list[str]:
+    hazards: list[str] = []
+    for change in changes:
+        rel = change["path"]
+        if Path(rel).is_absolute() or ".." in Path(rel).parts:
+            hazards.append(f"{rel}: unsafe path")
+        if has_symlink_parent(session.project, rel):
+            hazards.append(f"{rel}: target parent contains a symlink")
+        before_type = change.get("before", {}).get("type")
+        after_type = change.get("after", {}).get("type")
+        if not allow_symlinks and (before_type == "symlink" or after_type == "symlink"):
+            hazards.append(f"{rel}: symlink change requires --allow-symlinks")
+        target = session.project / rel
+        if target.exists() and target.is_symlink() and not allow_symlinks:
+            hazards.append(f"{rel}: real target is a symlink")
+        if not is_relative_to(target, session.project):
+            hazards.append(f"{rel}: resolved target escapes project")
+    return hazards
+
+
+def snapshot_project(project: Path, safe_home: Path, session_id: str, excludes: list[str]) -> Path:
+    snapshot_root = safe_home / "snapshots"
+    ensure_dir(snapshot_root)
+    target = snapshot_root / f"{session_id}-{now_slug()}"
+    safe_copytree(project, target, excludes)
+    return target
+
+
+def apply_changes(
+    session: Session,
+    safe_home: Path,
+    yes: bool,
+    allow_symlinks: bool,
+    excludes: list[str],
+) -> int:
+    changes = change_set(session.original, session.staging)
+    if not changes:
+        print("No staged changes to apply.")
+        return 0
+    hazards = guard_apply(session, changes, allow_symlinks)
+    if hazards:
+        print("Apply blocked:")
+        for hazard in hazards:
+            print(f"- {hazard}")
+        return 2
+    if not yes:
+        print("Apply requires explicit --yes after reviewing `pi-safe diff`.")
+        return 2
+
+    snapshot = snapshot_project(session.project, safe_home, session.session_id, excludes)
+    print(f"Snapshot: {snapshot}")
+    trash = find_trash()
+
+    for change in changes:
+        rel = change["path"]
+        source = session.staging / rel
+        target = session.project / rel
+        if change["kind"] == "deleted":
+            if not target.exists() and not target.is_symlink():
+                continue
+            if not trash:
+                raise PiSafeError("deletion requested but `trash` command is unavailable")
+            subprocess.run([trash, str(target)], check=True)
+            print(f"trashed: {rel}")
+            continue
+
+        ensure_dir(target.parent)
+        if source.is_symlink():
+            if not allow_symlinks:
+                raise PiSafeError(f"symlink apply blocked: {rel}")
+            link_target = os.readlink(source)
+            if target.exists() or target.is_symlink():
+                if not trash:
+                    raise PiSafeError("replacing target requires `trash`, but it is unavailable")
+                subprocess.run([trash, str(target)], check=True)
+            os.symlink(link_target, target)
+        else:
+            if target.exists() and target.is_symlink() and not allow_symlinks:
+                raise PiSafeError(f"real target is a symlink: {rel}")
+            shutil.copy2(source, target)
+        print(f"applied: {rel}")
+
+    print("Apply complete.")
+    return 0
+
+
+def list_sessions(safe_home: Path) -> int:
+    sessions_dir = safe_home / "sessions"
+    if not sessions_dir.exists():
+        print("No pi-safe sessions.")
+        return 0
+    for entry in sorted(sessions_dir.iterdir()):
+        if (entry / MANIFEST).exists():
+            data = read_json(entry / MANIFEST)
+            print(f"{data['sessionId']}\t{data['project']}")
+    return 0
+
+
+def cmd_run(args: argparse.Namespace) -> int:
+    project = resolve_existing_dir(args.project, "project")
+    safe_home = resolve_safe_home(args.safe_home)
+    excludes = DEFAULT_EXCLUDES + list(args.exclude or [])
+    session = create_session(project, safe_home, args.session, excludes, args.allow_system_temp)
+    pi_cmd = find_pi(args.pi)
+    if args.dry_run:
+        print(f"session: {session.session_id}")
+        print(f"staging: {session.staging}")
+        print(f"profile: {session.profile}")
+        print("command:")
+        print(" ".join([shutil.which("sandbox-exec") or "/usr/bin/sandbox-exec", "-f", str(session.profile), pi_cmd, *args.pi_args]))
+        return 0
+    return run_sandboxed_pi(session, pi_cmd, args.pi_args)
+
+
+def cmd_diff(args: argparse.Namespace) -> int:
+    session = load_session(resolve_safe_home(args.safe_home), args.session)
+    return print_diff(session)
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    safe_home = resolve_safe_home(args.safe_home)
+    session = load_session(safe_home, args.session)
+    excludes = DEFAULT_EXCLUDES + list(args.exclude or [])
+    return apply_changes(session, safe_home, args.yes, args.allow_symlinks, excludes)
+
+
+def cmd_profile(args: argparse.Namespace) -> int:
+    session = load_session(resolve_safe_home(args.safe_home), args.session)
+    print(session.profile.read_text(encoding="utf-8"))
+    return 0
+
+
+def run_sandbox_probe(profile: Path, cwd: Path, command: list[str]) -> subprocess.CompletedProcess[str]:
+    sandbox = shutil.which("sandbox-exec") or "/usr/bin/sandbox-exec"
+    return subprocess.run(
+        [sandbox, "-f", str(profile), *command],
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def cmd_selftest(args: argparse.Namespace) -> int:
+    safe_home = resolve_safe_home(args.safe_home)
+    root = safe_home / "selftests" / f"{now_slug()}-{uuid.uuid4().hex[:8]}"
+    staging = root / "staging"
+    writable = root / "writable"
+    outside = root / "outside"
+    ensure_dir(staging)
+    ensure_dir(writable)
+    ensure_dir(outside)
+    profile = root / PROFILE
+    profile.write_text(make_profile(staging, writable, False), encoding="utf-8")
+
+    victim = outside / "victim.txt"
+    victim.write_text("safe\n", encoding="utf-8")
+    (staging / "escape-link").symlink_to(victim)
+
+    probes: list[tuple[str, list[str], bool]] = [
+        ("allowed write in staging", ["/usr/bin/touch", str(staging / "allowed.txt")], True),
+        ("denied write outside staging", ["/usr/bin/touch", str(outside / "denied.txt")], False),
+        ("denied rm outside staging", ["/bin/rm", "-f", str(victim)], False),
+        (
+            "denied python unlink outside staging",
+            ["/usr/bin/python3", "-c", f"import os; os.unlink({str(victim)!r})"],
+            False,
+        ),
+        (
+            "denied symlink escape write",
+            ["/usr/bin/python3", "-c", "open('escape-link','w').write('owned')"],
+            False,
+        ),
+    ]
+
+    failed = False
+    for name, command, should_pass in probes:
+        result = run_sandbox_probe(profile, staging, command)
+        passed = result.returncode == 0
+        ok = passed is should_pass
+        print(f"{'PASS' if ok else 'FAIL'} {name}: exit={result.returncode}")
+        if result.stderr.strip():
+            print(f"  stderr: {result.stderr.strip().splitlines()[-1]}")
+        if not ok:
+            failed = True
+    if not victim.exists() or victim.read_text(encoding="utf-8") != "safe\n":
+        print("FAIL protected victim changed")
+        failed = True
+    else:
+        print("PASS protected victim survived")
+
+    project = root / "project"
+    ensure_dir(project)
+    (project / "delete-me.txt").write_text("delete through staging\n", encoding="utf-8")
+    session = create_session(project, safe_home, f"selftest-{uuid.uuid4().hex[:8]}", DEFAULT_EXCLUDES, False)
+    trash = find_trash()
+    if trash:
+        subprocess.run([trash, str(session.staging / "delete-me.txt")], check=True)
+        rc = apply_changes(session, safe_home, True, False, DEFAULT_EXCLUDES)
+        if rc == 0 and not (project / "delete-me.txt").exists():
+            print("PASS staged deletion applied through trash with snapshot")
+        else:
+            print("FAIL staged deletion apply path")
+            failed = True
+    else:
+        print("SKIP staged deletion apply path: trash command unavailable")
+
+    print(f"selftest root: {root}")
+    return 1 if failed else 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="pi-safe", description="Run Pi in a macOS write-deny staging sandbox.")
+    parser.add_argument("--version", action="version", version=f"pi-safe {VERSION}")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    run = sub.add_parser("run", help="create a staging session and run pi under sandbox-exec")
+    run.add_argument("--project", default=".", help="real project to copy into staging")
+    run.add_argument("--safe-home", help="pi-safe state directory (default: ~/.pi-safe or PI_SAFE_HOME)")
+    run.add_argument("--session", help="explicit session id")
+    run.add_argument("--pi", help="path to pi executable")
+    run.add_argument("--exclude", action="append", help="additional copy exclude pattern")
+    run.add_argument("--allow-system-temp", action="store_true", help="also allow writes to /tmp and /private/tmp")
+    run.add_argument("--dry-run", action="store_true", help="create session and print command without running pi")
+    run.add_argument("pi_args", nargs=argparse.REMAINDER, help="arguments passed to pi after --")
+    run.set_defaults(func=cmd_run)
+
+    diff = sub.add_parser("diff", help="show staged changes for a session")
+    diff.add_argument("session")
+    diff.add_argument("--safe-home")
+    diff.set_defaults(func=cmd_diff)
+
+    apply = sub.add_parser("apply", help="apply reviewed staged changes to the real project")
+    apply.add_argument("session")
+    apply.add_argument("--safe-home")
+    apply.add_argument("--yes", action="store_true", help="required confirmation after reviewing diff")
+    apply.add_argument("--allow-symlinks", action="store_true", help="allow symlink changes during apply")
+    apply.add_argument("--exclude", action="append", help="additional snapshot exclude pattern")
+    apply.set_defaults(func=cmd_apply)
+
+    profile = sub.add_parser("profile", help="print the generated sandbox profile")
+    profile.add_argument("session")
+    profile.add_argument("--safe-home")
+    profile.set_defaults(func=cmd_profile)
+
+    sessions = sub.add_parser("sessions", help="list sessions")
+    sessions.add_argument("--safe-home")
+    sessions.set_defaults(func=lambda args: list_sessions(resolve_safe_home(args.safe_home)))
+
+    selftest = sub.add_parser("selftest", help="run destructive-attempt sandbox probes in a temp test tree")
+    selftest.add_argument("--safe-home")
+    selftest.set_defaults(func=cmd_selftest)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if getattr(args, "pi_args", None) and args.pi_args[:1] == ["--"]:
+        args.pi_args = args.pi_args[1:]
+    try:
+        return args.func(args)
+    except PiSafeError as exc:
+        print(f"pi-safe: {exc}", file=sys.stderr)
+        return 2
+    except subprocess.CalledProcessError as exc:
+        print(f"pi-safe: command failed: {exc}", file=sys.stderr)
+        return exc.returncode or 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
