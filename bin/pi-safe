@@ -19,11 +19,13 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 MANIFEST = "pi-safe-session.json"
 PROFILE = "pi-safe.sb"
 DEFAULT_EXCLUDES = [".git", ".pi-safe", ".DS_Store"]
 TEXT_DIFF_MAX_BYTES = 1024 * 1024
+COMMANDS = {"run", "diff", "apply", "profile", "sessions", "selftest"}
+TOP_LEVEL_OPTIONS = {"--help", "-h", "--version"}
 
 
 class PiSafeError(Exception):
@@ -598,8 +600,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def normalize_argv(argv: list[str]) -> list[str]:
+    """Route shorthand invocations to `run`.
+
+    `pi-safe` should be the common path: start Pi in a sandbox for the current
+    directory. Subcommands remain explicit for review/apply operations.
+    """
+    if not argv:
+        return ["run"]
+    first = argv[0]
+    if first in COMMANDS or first in TOP_LEVEL_OPTIONS:
+        return argv
+    return ["run", *argv]
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
+    argv = normalize_argv(list(sys.argv[1:] if argv is None else argv))
     args = parser.parse_args(argv)
     if getattr(args, "pi_args", None) and args.pi_args[:1] == ["--"]:
         args.pi_args = args.pi_args[1:]

@@ -43,6 +43,19 @@ Requirements:
 Start a sandboxed Pi session:
 
 ```bash
+pi-safe
+```
+
+By default, bare `pi-safe` starts Pi for the current directory. You can pass a
+prompt directly:
+
+```bash
+pi-safe "review this code"
+```
+
+Use `run` when you want to choose a different project directory:
+
+```bash
 pi-safe run --project /path/to/repo -- "review this code"
 ```
 
