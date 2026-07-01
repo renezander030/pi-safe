@@ -104,6 +104,23 @@ class PiSafeUnitTests(unittest.TestCase):
         self.assertIn('"extensions": ["./src/index.ts"]', package_json.read_text(encoding="utf-8"))
         self.assertIn('registerCommand("sandbox"', index_ts.read_text(encoding="utf-8"))
 
+    def test_pi_launch_args_load_session_status_extension_explicitly(self):
+        root = ROOT / "tmp" / f"pi-safe-launch-{uuid.uuid4().hex}"
+        project = root / "project"
+        original = root / "original"
+        staging = root / "staging"
+        writable = root / "writable"
+        for path in [project, original, staging, writable]:
+            path.mkdir(parents=True)
+        session = pi_safe.Session("unit", project, root, original, staging, writable, root / pi_safe.PROFILE)
+
+        args = pi_safe.pi_launch_args(session, "/opt/homebrew/bin/pi", ["review this"])
+
+        self.assertEqual(args[0], "/opt/homebrew/bin/pi")
+        self.assertEqual(args[1], "--extension")
+        self.assertEqual(args[2], str(writable / "pi-agent" / "extensions" / "pi-safe-status" / "src" / "index.ts"))
+        self.assertEqual(args[3:], ["review this"])
+
     def test_apply_guard_blocks_symlink_changes(self):
         root = ROOT / "tmp" / f"pi-safe-symlink-{uuid.uuid4().hex}"
         project = root / "project"

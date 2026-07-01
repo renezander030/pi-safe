@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 MANIFEST = "pi-safe-session.json"
 PROFILE = "pi-safe.sb"
 DEFAULT_EXCLUDES = [".git", ".pi-safe", ".DS_Store"]
@@ -176,6 +176,14 @@ def install_session_status_extension(session: Session) -> None:
     write_if_changed(src / "index.ts", SESSION_EXTENSION_SOURCE)
 
 
+def session_status_extension_path(session: Session) -> Path:
+    return session.writable / "pi-agent" / "extensions" / "pi-safe-status" / "src" / "index.ts"
+
+
+def pi_launch_args(session: Session, pi_cmd: str, pi_args: list[str]) -> list[str]:
+    return [pi_cmd, "--extension", str(session_status_extension_path(session)), *pi_args]
+
+
 def create_session(
     project: Path,
     safe_home: Path,
@@ -277,7 +285,7 @@ def run_sandboxed_pi(session: Session, pi_cmd: str, pi_args: list[str]) -> int:
         }
     )
 
-    cmd = [sandbox, "-f", str(session.profile), pi_cmd, *pi_args]
+    cmd = [sandbox, "-f", str(session.profile), *pi_launch_args(session, pi_cmd, pi_args)]
     print(f"pi-safe session: {session.session_id}")
     print(f"real project:    {session.project}")
     print(f"staging project: {session.staging}")
@@ -516,7 +524,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"staging: {session.staging}")
         print(f"profile: {session.profile}")
         print("command:")
-        print(" ".join([shutil.which("sandbox-exec") or "/usr/bin/sandbox-exec", "-f", str(session.profile), pi_cmd, *args.pi_args]))
+        print(" ".join([shutil.which("sandbox-exec") or "/usr/bin/sandbox-exec", "-f", str(session.profile), *pi_launch_args(session, pi_cmd, args.pi_args)]))
         return 0
     return run_sandboxed_pi(session, pi_cmd, args.pi_args)
 

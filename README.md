@@ -85,8 +85,10 @@ Inside a sandboxed Pi session, run:
 /sandbox
 ```
 
-That command is injected into the session by `pi-safe` and reports the active
-session id, real project path, staging path, sandbox profile, and safe-home.
+That command is explicitly loaded into the session by `pi-safe` and reports the
+active session id, real project path, staging path, sandbox profile, and
+safe-home. Already-open Pi sessions will not gain this command; start a new
+`pi` session after updating.
 
 Use `run` when you want to choose a different project directory:
 
