@@ -19,13 +19,41 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 MANIFEST = "pi-safe-session.json"
 PROFILE = "pi-safe.sb"
 DEFAULT_EXCLUDES = [".git", ".pi-safe", ".DS_Store"]
 TEXT_DIFF_MAX_BYTES = 1024 * 1024
-COMMANDS = {"run", "diff", "apply", "profile", "sessions", "selftest", "help"}
+COMMANDS = {"run", "diff", "apply", "profile", "sessions", "selftest", "status", "help"}
 TOP_LEVEL_OPTIONS = {"--help", "-h", "--version"}
+SESSION_EXTENSION_PACKAGE = """{
+  "name": "pi-safe-status",
+  "version": "1.0.0",
+  "private": true,
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  }
+}
+"""
+SESSION_EXTENSION_SOURCE = r'''export default function (pi: any) {
+  pi.registerCommand("sandbox", {
+    description: "Show pi-safe sandbox status for this Pi session",
+    handler: async (_args: string, ctx: any) => {
+      const env = process.env;
+      const active = env.PI_SAFE_ACTIVE === "1";
+      const lines = [
+        "pi-safe sandbox: " + (active ? "ACTIVE" : "INACTIVE"),
+        "session:         " + (env.PI_SAFE_SESSION_ID || "(none)"),
+        "real project:    " + (env.PI_SAFE_PROJECT || "(unknown)"),
+        "staging project: " + (env.PI_SAFE_STAGING || process.cwd()),
+        "profile:         " + (env.PI_SAFE_PROFILE || "(unknown)"),
+        "safe home:       " + (env.PI_SAFE_HOME || "(unknown)"),
+      ];
+      ctx.ui.notify(lines.join("\n"), active ? "info" : "warning");
+    },
+  });
+}
+'''
 
 
 class PiSafeError(Exception):
@@ -83,6 +111,12 @@ def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def write_if_changed(path: Path, text: str) -> None:
+    if path.exists() and path.read_text(encoding="utf-8") == text:
+        return
+    path.write_text(text, encoding="utf-8")
+
+
 def write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -134,6 +168,14 @@ def safe_copytree(src: Path, dest: Path, excludes: list[str], exclude_paths: lis
     shutil.copytree(src, dest, symlinks=True, ignore=ignore)
 
 
+def install_session_status_extension(session: Session) -> None:
+    ext = session.writable / "pi-agent" / "extensions" / "pi-safe-status"
+    src = ext / "src"
+    ensure_dir(src)
+    write_if_changed(ext / "package.json", SESSION_EXTENSION_PACKAGE)
+    write_if_changed(src / "index.ts", SESSION_EXTENSION_SOURCE)
+
+
 def create_session(
     project: Path,
     safe_home: Path,
@@ -164,6 +206,7 @@ def create_session(
     profile.write_text(make_profile(staging, writable, allow_system_temp), encoding="utf-8")
 
     session = Session(session_id, project, root, original, staging, writable, profile)
+    install_session_status_extension(session)
     write_json(
         root / MANIFEST,
         {
@@ -222,6 +265,15 @@ def run_sandboxed_pi(session: Session, pi_cmd: str, pi_args: list[str]) -> int:
             "TEMP": str(session.writable / "tmp"),
             "PI_CODING_AGENT_DIR": str(session.writable / "pi-agent"),
             "PI_CODING_AGENT_SESSION_DIR": str(session.writable / "pi-sessions"),
+            "PI_SAFE_ACTIVE": "1",
+            "PI_SAFE_SESSION_ID": session.session_id,
+            "PI_SAFE_PROJECT": str(session.project),
+            "PI_SAFE_STAGING": str(session.staging),
+            "PI_SAFE_PROFILE": str(session.profile),
+            "PI_SAFE_HOME": str(session.root.parent.parent),
+            "PI_SAFE_WRITABLE": str(session.writable),
+            "PI_SAFE_REAL_PI": pi_cmd,
+            "PI_SAFE_BYPASS": "0",
         }
     )
 
@@ -566,6 +618,34 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+def status_lines(args: argparse.Namespace) -> list[str]:
+    bypass = str(getattr(args, "bypass", "") or os.environ.get("PI_SAFE_BYPASS", "")).lower()
+    bypass_active = bypass in {"1", "true", "yes", "on"}
+    wrapper = getattr(args, "wrapper", None) or "(not provided)"
+    pi_safe = getattr(args, "pi_safe", None) or str(Path(sys.argv[0]).expanduser())
+    real_pi = getattr(args, "real_pi", None) or os.environ.get("PI_SAFE_REAL_PI") or "(not provided)"
+    sandbox_exec = shutil.which("sandbox-exec") or "/usr/bin/sandbox-exec"
+    from_wrapper = bool(getattr(args, "from_wrapper", False))
+    active = from_wrapper and not bypass_active
+
+    return [
+        f"pi-safe wrapper: {'ACTIVE' if active else 'INACTIVE'}",
+        f"bypass:          {'on' if bypass_active else 'off'}",
+        f"wrapper:         {wrapper}",
+        f"pi-safe:         {pi_safe}",
+        f"real pi:         {real_pi}",
+        f"safe home:       {resolve_safe_home(getattr(args, 'safe_home', None))}",
+        f"sandbox-exec:    {sandbox_exec if Path(sandbox_exec).exists() else 'missing'}",
+        "",
+        "Inside a sandboxed Pi session, run /sandbox to verify the active session.",
+    ]
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    print("\n".join(status_lines(args)))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pi-safe", description="Run Pi in a macOS write-deny staging sandbox.")
     parser.add_argument("--version", action="version", version=f"pi-safe {VERSION}")
@@ -608,6 +688,15 @@ def build_parser() -> argparse.ArgumentParser:
     selftest.add_argument("--safe-home")
     selftest.set_defaults(func=cmd_selftest)
 
+    status = sub.add_parser("status", help="show pi-safe wrapper/sandbox status")
+    status.add_argument("--safe-home")
+    status.add_argument("--from-wrapper", action="store_true")
+    status.add_argument("--wrapper")
+    status.add_argument("--pi-safe", dest="pi_safe")
+    status.add_argument("--real-pi")
+    status.add_argument("--bypass")
+    status.set_defaults(func=cmd_status)
+
     return parser
 
 
@@ -620,6 +709,8 @@ def normalize_argv(argv: list[str]) -> list[str]:
     if not argv:
         return ["run"]
     first = argv[0]
+    if first == "/sandbox":
+        return ["status", *argv[1:]]
     if first == "help":
         return ["--help"]
     if first in COMMANDS or first in TOP_LEVEL_OPTIONS:

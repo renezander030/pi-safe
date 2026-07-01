@@ -29,6 +29,12 @@ find_real_pi() {
   return 127
 }
 
+if [ "${1:-}" = "/sandbox" ]; then
+  real_pi=$(find_real_pi 2>/dev/null || true)
+  [ -n "$real_pi" ] || real_pi="(not found)"
+  exec "$pi_safe_bin" status --from-wrapper --wrapper "$self_path" --pi-safe "$pi_safe_bin" --real-pi "$real_pi" --bypass "${PI_SAFE_BYPASS:-0}"
+fi
+
 real_pi=$(find_real_pi)
 
 if [ "${PI_SAFE_BYPASS:-}" = "1" ]; then

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import importlib.machinery
 import pathlib
 import uuid
@@ -22,6 +23,24 @@ class PiSafeUnitTests(unittest.TestCase):
 
     def test_help_shorthand_shows_help(self):
         self.assertEqual(pi_safe.normalize_argv(["help"]), ["--help"])
+
+    def test_slash_sandbox_routes_to_status(self):
+        self.assertEqual(pi_safe.normalize_argv(["/sandbox"]), ["status"])
+
+    def test_status_lines_reports_wrapper_active(self):
+        args = argparse.Namespace(
+            bypass="0",
+            wrapper="/Users/example/.local/bin/pi",
+            pi_safe="/Users/example/.local/bin/pi-safe",
+            real_pi="/opt/homebrew/bin/pi",
+            safe_home=str(ROOT / "tmp" / "pi-safe-status-home"),
+            from_wrapper=True,
+        )
+
+        lines = pi_safe.status_lines(args)
+
+        self.assertIn("pi-safe wrapper: ACTIVE", lines[0])
+        self.assertTrue(any("/opt/homebrew/bin/pi" in line for line in lines))
 
     def test_profile_denies_global_writes_and_allows_staging(self):
         profile = pi_safe.make_profile(pathlib.Path("/tmp/staging"), pathlib.Path("/tmp/writable"), False)
@@ -66,6 +85,24 @@ class PiSafeUnitTests(unittest.TestCase):
 
         self.assertTrue((dest / "keep.txt").exists())
         self.assertFalse((dest / ".pi-safe-state").exists())
+
+    def test_session_status_extension_written(self):
+        root = ROOT / "tmp" / f"pi-safe-extension-{uuid.uuid4().hex}"
+        project = root / "project"
+        original = root / "original"
+        staging = root / "staging"
+        writable = root / "writable"
+        for path in [project, original, staging, writable]:
+            path.mkdir(parents=True)
+        session = pi_safe.Session("unit", project, root, original, staging, writable, root / pi_safe.PROFILE)
+
+        pi_safe.install_session_status_extension(session)
+
+        package_json = writable / "pi-agent" / "extensions" / "pi-safe-status" / "package.json"
+        index_ts = writable / "pi-agent" / "extensions" / "pi-safe-status" / "src" / "index.ts"
+        self.assertTrue(package_json.exists())
+        self.assertIn('"extensions": ["./src/index.ts"]', package_json.read_text(encoding="utf-8"))
+        self.assertIn('registerCommand("sandbox"', index_ts.read_text(encoding="utf-8"))
 
     def test_apply_guard_blocks_symlink_changes(self):
         root = ROOT / "tmp" / f"pi-safe-symlink-{uuid.uuid4().hex}"

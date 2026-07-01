@@ -48,6 +48,12 @@ to run Pi without the sandbox, for example:
 PI_SAFE_BYPASS=1 pi --help
 ```
 
+Check whether the wrapper is active before launching Pi:
+
+```bash
+pi /sandbox
+```
+
 Requirements:
 
 - macOS with `/usr/bin/sandbox-exec`
@@ -72,6 +78,15 @@ pi-safe "review this code"
 # or, with the wrapper installed:
 pi "review this code"
 ```
+
+Inside a sandboxed Pi session, run:
+
+```text
+/sandbox
+```
+
+That command is injected into the session by `pi-safe` and reports the active
+session id, real project path, staging path, sandbox profile, and safe-home.
 
 Use `run` when you want to choose a different project directory:
 
