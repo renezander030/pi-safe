@@ -1,0 +1,38 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd -P)
+self_path="$script_dir/$(basename "$0")"
+pi_safe_bin="${PI_SAFE_BIN:-$script_dir/pi-safe}"
+
+find_real_pi() {
+  if [ -n "${PI_SAFE_REAL_PI:-}" ]; then
+    printf '%s\n' "$PI_SAFE_REAL_PI"
+    return 0
+  fi
+
+  old_ifs=$IFS
+  IFS=:
+  for dir in $PATH; do
+    [ -n "$dir" ] || dir=.
+    real_dir=$(CDPATH= cd "$dir" 2>/dev/null && pwd -P) || continue
+    candidate="$real_dir/pi"
+    [ -x "$candidate" ] || continue
+    [ "$candidate" = "$self_path" ] && continue
+    printf '%s\n' "$candidate"
+    IFS=$old_ifs
+    return 0
+  done
+  IFS=$old_ifs
+
+  echo "pi-safe wrapper: could not find the real pi binary; set PI_SAFE_REAL_PI=/path/to/pi" >&2
+  return 127
+}
+
+real_pi=$(find_real_pi)
+
+if [ "${PI_SAFE_BYPASS:-}" = "1" ]; then
+  exec "$real_pi" "$@"
+fi
+
+exec "$pi_safe_bin" run --pi "$real_pi" -- "$@"

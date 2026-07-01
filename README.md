@@ -31,6 +31,23 @@ cd pi-safe
 install -m 755 bin/pi-safe ~/.local/bin/pi-safe
 ```
 
+Optional transparent mode: install the `pi` wrapper ahead of the real Pi binary
+on your `PATH`. Then normal `pi ...` invocations run through `pi-safe`.
+
+```bash
+install -m 755 bin/pi ~/.local/bin/pi
+# ensure ~/.local/bin appears before /opt/homebrew/bin in PATH
+```
+
+The wrapper discovers the next real `pi` binary on `PATH` and passes it to
+`pi-safe --pi`, avoiding recursion. Set `PI_SAFE_REAL_PI=/path/to/pi` if you
+want to pin the real binary, or `PI_SAFE_BYPASS=1` when you intentionally need
+to run Pi without the sandbox, for example:
+
+```bash
+PI_SAFE_BYPASS=1 pi --help
+```
+
 Requirements:
 
 - macOS with `/usr/bin/sandbox-exec`
@@ -46,11 +63,14 @@ Start a sandboxed Pi session:
 pi-safe
 ```
 
-By default, bare `pi-safe` starts Pi for the current directory. You can pass a
-prompt directly:
+By default, bare `pi-safe` starts Pi for the current directory. If you installed
+the optional wrapper, bare `pi` does the same thing. You can pass a prompt
+directly:
 
 ```bash
 pi-safe "review this code"
+# or, with the wrapper installed:
+pi "review this code"
 ```
 
 Use `run` when you want to choose a different project directory:

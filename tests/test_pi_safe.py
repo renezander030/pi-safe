@@ -20,6 +20,9 @@ class PiSafeUnitTests(unittest.TestCase):
     def test_subcommands_stay_subcommands(self):
         self.assertEqual(pi_safe.normalize_argv(["diff", "abc123"]), ["diff", "abc123"])
 
+    def test_help_shorthand_shows_help(self):
+        self.assertEqual(pi_safe.normalize_argv(["help"]), ["--help"])
+
     def test_profile_denies_global_writes_and_allows_staging(self):
         profile = pi_safe.make_profile(pathlib.Path("/tmp/staging"), pathlib.Path("/tmp/writable"), False)
         self.assertIn("(deny file-write*)", profile)

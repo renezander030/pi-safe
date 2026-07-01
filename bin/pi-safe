@@ -24,7 +24,7 @@ MANIFEST = "pi-safe-session.json"
 PROFILE = "pi-safe.sb"
 DEFAULT_EXCLUDES = [".git", ".pi-safe", ".DS_Store"]
 TEXT_DIFF_MAX_BYTES = 1024 * 1024
-COMMANDS = {"run", "diff", "apply", "profile", "sessions", "selftest"}
+COMMANDS = {"run", "diff", "apply", "profile", "sessions", "selftest", "help"}
 TOP_LEVEL_OPTIONS = {"--help", "-h", "--version"}
 
 
@@ -609,6 +609,8 @@ def normalize_argv(argv: list[str]) -> list[str]:
     if not argv:
         return ["run"]
     first = argv[0]
+    if first == "help":
+        return ["--help"]
     if first in COMMANDS or first in TOP_LEVEL_OPTIONS:
         return argv
     return ["run", *argv]
