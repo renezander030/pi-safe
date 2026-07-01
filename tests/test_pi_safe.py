@@ -53,6 +53,20 @@ class PiSafeUnitTests(unittest.TestCase):
             },
         )
 
+    def test_safe_copytree_excludes_safe_home_inside_project(self):
+        root = ROOT / "tmp" / f"pi-safe-copy-{uuid.uuid4().hex}"
+        project = root / "project"
+        safe_home = project / ".pi-safe-state"
+        dest = root / "copy"
+        safe_home.mkdir(parents=True)
+        (project / "keep.txt").write_text("keep\n", encoding="utf-8")
+        (safe_home / "state.txt").write_text("state\n", encoding="utf-8")
+
+        pi_safe.safe_copytree(project, dest, [], [safe_home])
+
+        self.assertTrue((dest / "keep.txt").exists())
+        self.assertFalse((dest / ".pi-safe-state").exists())
+
     def test_apply_guard_blocks_symlink_changes(self):
         root = ROOT / "tmp" / f"pi-safe-symlink-{uuid.uuid4().hex}"
         project = root / "project"

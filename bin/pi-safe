@@ -116,10 +116,21 @@ def make_profile(staging: Path, writable: Path, allow_system_temp: bool = False)
     )
 
 
-def safe_copytree(src: Path, dest: Path, excludes: list[str]) -> None:
+def safe_copytree(src: Path, dest: Path, excludes: list[str], exclude_paths: list[Path] | None = None) -> None:
     if dest.exists():
         raise PiSafeError(f"refusing to overwrite existing copy destination: {dest}")
-    ignore = shutil.ignore_patterns(*excludes) if excludes else None
+    pattern_ignore = shutil.ignore_patterns(*excludes) if excludes else None
+    exclude_roots = [path.resolve() for path in (exclude_paths or [])]
+
+    def ignore(dir_path: str, names: list[str]) -> set[str]:
+        ignored = set(pattern_ignore(dir_path, names) if pattern_ignore else [])
+        current = Path(dir_path).resolve()
+        for name in names:
+            child = current / name
+            if any(child == root or is_relative_to(child, root) for root in exclude_roots):
+                ignored.add(name)
+        return ignored
+
     shutil.copytree(src, dest, symlinks=True, ignore=ignore)
 
 
@@ -148,8 +159,8 @@ def create_session(
     ensure_dir(writable / "pi-sessions")
     ensure_dir(root / "logs")
 
-    safe_copytree(project, original, excludes)
-    safe_copytree(project, staging, excludes)
+    safe_copytree(project, original, excludes, [safe_home])
+    safe_copytree(project, staging, excludes, [safe_home])
     profile.write_text(make_profile(staging, writable, allow_system_temp), encoding="utf-8")
 
     session = Session(session_id, project, root, original, staging, writable, profile)
@@ -368,7 +379,7 @@ def snapshot_project(project: Path, safe_home: Path, session_id: str, excludes: 
     snapshot_root = safe_home / "snapshots"
     ensure_dir(snapshot_root)
     target = snapshot_root / f"{session_id}-{now_slug()}"
-    safe_copytree(project, target, excludes)
+    safe_copytree(project, target, excludes, [safe_home])
     return target
 
 
