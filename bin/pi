@@ -3,13 +3,43 @@ set -eu
 
 script_dir=$(CDPATH= cd "$(dirname "$0")" && pwd -P)
 self_path="$script_dir/$(basename "$0")"
-pi_safe_bin="${PI_SAFE_BIN:-$script_dir/pi-safe}"
+
+find_pi_safe() {
+  if [ -n "${PI_SAFE_BIN:-}" ]; then
+    printf '%s\n' "$PI_SAFE_BIN"
+    return 0
+  fi
+
+  for candidate in "$script_dir/pi-safe" "$HOME/.local/bin/pi-safe" "/opt/homebrew/bin/pi-safe"; do
+    [ -x "$candidate" ] || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+
+  found=$(command -v pi-safe 2>/dev/null || true)
+  if [ -n "$found" ]; then
+    printf '%s\n' "$found"
+    return 0
+  fi
+
+  echo "pi-safe wrapper: could not find pi-safe; set PI_SAFE_BIN=/path/to/pi-safe" >&2
+  return 127
+}
 
 find_real_pi() {
   if [ -n "${PI_SAFE_REAL_PI:-}" ]; then
     printf '%s\n' "$PI_SAFE_REAL_PI"
     return 0
   fi
+
+  for candidate in \
+    "/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js" \
+    "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js"
+  do
+    [ -x "$candidate" ] || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
 
   old_ifs=$IFS
   IFS=:
@@ -28,6 +58,8 @@ find_real_pi() {
   echo "pi-safe wrapper: could not find the real pi binary; set PI_SAFE_REAL_PI=/path/to/pi" >&2
   return 127
 }
+
+pi_safe_bin=$(find_pi_safe)
 
 if [ "${1:-}" = "/sandbox" ]; then
   real_pi=$(find_real_pi 2>/dev/null || true)
