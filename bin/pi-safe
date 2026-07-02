@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import uuid
 from dataclasses import dataclass
@@ -729,6 +730,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     victim = outside / "victim.txt"
     victim.write_text("safe\n", encoding="utf-8")
     (staging / "escape-link").symlink_to(victim)
+    python_cmd = sys.executable or shutil.which("python3") or "/usr/bin/python3"
 
     probes: list[tuple[str, list[str], bool]] = [
         ("allowed write in staging", ["/usr/bin/touch", str(staging / "allowed.txt")], True),
@@ -736,12 +738,12 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         ("denied rm outside staging", ["/bin/rm", "-f", str(victim)], False),
         (
             "denied python unlink outside staging",
-            ["/usr/bin/python3", "-c", f"import os; os.unlink({str(victim)!r})"],
+            [python_cmd, "-c", f"import os; os.unlink({str(victim)!r})"],
             False,
         ),
         (
             "denied symlink escape write",
-            ["/usr/bin/python3", "-c", "open('escape-link','w').write('owned')"],
+            [python_cmd, "-c", "open('escape-link','w').write('owned')"],
             False,
         ),
     ]
@@ -762,21 +764,21 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     else:
         print("PASS protected victim survived")
 
-    project = root / "project"
-    ensure_dir(project)
-    (project / "delete-me.txt").write_text("delete through staging\n", encoding="utf-8")
-    session = create_session(project, safe_home, f"selftest-{uuid.uuid4().hex[:8]}", DEFAULT_EXCLUDES, False)
-    trash = find_trash()
-    if trash:
-        subprocess.run([trash, str(session.staging / "delete-me.txt")], check=True)
-        rc = apply_changes(session, safe_home, True, False, DEFAULT_EXCLUDES)
-        if rc == 0 and not (project / "delete-me.txt").exists():
-            print("PASS staged deletion applied through trash with snapshot")
+    with tempfile.TemporaryDirectory(prefix="pi-safe-selftest-project-") as project_tmp:
+        project = Path(project_tmp).resolve()
+        (project / "delete-me.txt").write_text("delete through staging\n", encoding="utf-8")
+        session = create_session(project, safe_home, f"selftest-{uuid.uuid4().hex[:8]}", DEFAULT_EXCLUDES, False)
+        trash = find_trash()
+        if trash:
+            subprocess.run([trash, str(session.staging / "delete-me.txt")], check=True)
+            rc = apply_changes(session, safe_home, True, False, DEFAULT_EXCLUDES)
+            if rc == 0 and not (project / "delete-me.txt").exists():
+                print("PASS staged deletion applied through trash with snapshot")
+            else:
+                print("FAIL staged deletion apply path")
+                failed = True
         else:
-            print("FAIL staged deletion apply path")
-            failed = True
-    else:
-        print("SKIP staged deletion apply path: trash command unavailable")
+            print("SKIP staged deletion apply path: trash command unavailable")
 
     print(f"selftest root: {root}")
     return 1 if failed else 0
