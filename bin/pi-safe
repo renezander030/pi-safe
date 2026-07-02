@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 MANIFEST = "pi-safe-session.json"
 PROFILE = "pi-safe.sb"
 DEFAULT_EXCLUDES = [".git", ".pi-safe", ".DS_Store"]
@@ -35,21 +35,47 @@ SESSION_EXTENSION_PACKAGE = """{
   }
 }
 """
-SESSION_EXTENSION_SOURCE = r'''export default function (pi: any) {
+SESSION_EXTENSION_SOURCE = r'''function sandboxStatus() {
+  const env = process.env;
+  const active = env.PI_SAFE_ACTIVE === "1";
+  const lines = [
+    "pi-safe sandbox: " + (active ? "ACTIVE" : "INACTIVE"),
+    "session:         " + (env.PI_SAFE_SESSION_ID || "(none)"),
+    "real project:    " + (env.PI_SAFE_PROJECT || "(unknown)"),
+    "staging project: " + (env.PI_SAFE_STAGING || process.cwd()),
+    "profile:         " + (env.PI_SAFE_PROFILE || "(unknown)"),
+    "safe home:       " + (env.PI_SAFE_HOME || "(unknown)"),
+  ];
+  return { active, lines };
+}
+
+export default function (pi: any) {
+  pi.on("session_start", async (_event: any, ctx: any) => {
+    const status = sandboxStatus();
+    if (status.active) {
+      ctx.ui.setStatus("pi-safe", "sandbox active");
+    }
+  });
+
   pi.registerCommand("sandbox", {
     description: "Show pi-safe sandbox status for this Pi session",
     handler: async (_args: string, ctx: any) => {
-      const env = process.env;
-      const active = env.PI_SAFE_ACTIVE === "1";
-      const lines = [
-        "pi-safe sandbox: " + (active ? "ACTIVE" : "INACTIVE"),
-        "session:         " + (env.PI_SAFE_SESSION_ID || "(none)"),
-        "real project:    " + (env.PI_SAFE_PROJECT || "(unknown)"),
-        "staging project: " + (env.PI_SAFE_STAGING || process.cwd()),
-        "profile:         " + (env.PI_SAFE_PROFILE || "(unknown)"),
-        "safe home:       " + (env.PI_SAFE_HOME || "(unknown)"),
-      ];
-      ctx.ui.notify(lines.join("\n"), active ? "info" : "warning");
+      const status = sandboxStatus();
+      const text = status.lines.join("\n");
+      pi.sendMessage({
+        customType: "pi-safe",
+        content: [{ type: "text", text }],
+        display: text,
+        details: {
+          active: status.active,
+          sessionId: process.env.PI_SAFE_SESSION_ID || null,
+          project: process.env.PI_SAFE_PROJECT || null,
+          staging: process.env.PI_SAFE_STAGING || null,
+          profile: process.env.PI_SAFE_PROFILE || null,
+          safeHome: process.env.PI_SAFE_HOME || null,
+        },
+      });
+      ctx.ui.notify("pi-safe sandbox: " + (status.active ? "ACTIVE" : "INACTIVE"), status.active ? "info" : "warning");
     },
   });
 }
@@ -90,6 +116,40 @@ def resolve_existing_dir(value: str, label: str) -> Path:
 
 def resolve_safe_home(value: str | None) -> Path:
     return Path(value).expanduser().resolve() if value else default_safe_home().resolve()
+
+
+def unsafe_project_root_reason(project: Path, safe_home: Path) -> str | None:
+    home = Path.home().resolve()
+    root = Path(project.anchor or "/").resolve()
+    broad_home_dirs = {
+        home,
+        home.parent,
+        home / "Desktop",
+        home / "Documents",
+        home / "Downloads",
+        home / "Library",
+        home / "Movies",
+        home / "Music",
+        home / "Pictures",
+    }
+
+    if project == root:
+        return f"refusing to sandbox filesystem root: {project}"
+    if project in broad_home_dirs:
+        return f"refusing to sandbox broad directory: {project}"
+    if project == safe_home or is_relative_to(project, safe_home):
+        return f"refusing to use pi-safe state as the project: {project}"
+    return None
+
+
+def validate_project_root(project: Path, safe_home: Path) -> None:
+    reason = unsafe_project_root_reason(project, safe_home)
+    if reason:
+        raise PiSafeError(
+            reason
+            + ". pi-safe copies the project before launching Pi; cd into a repo/workspace "
+            + "or pass --project /path/to/repo."
+        )
 
 
 def is_relative_to(path: Path, root: Path) -> bool:
@@ -516,6 +576,7 @@ def list_sessions(safe_home: Path) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     project = resolve_existing_dir(args.project, "project")
     safe_home = resolve_safe_home(args.safe_home)
+    validate_project_root(project, safe_home)
     excludes = DEFAULT_EXCLUDES + list(args.exclude or [])
     session = create_session(project, safe_home, args.session, excludes, args.allow_system_temp)
     pi_cmd = find_pi(args.pi)

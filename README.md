@@ -79,6 +79,15 @@ pi-safe "review this code"
 pi "review this code"
 ```
 
+Start `pi` from the repo or workspace you want to protect. `pi-safe` copies the
+project before launching Pi, so it refuses broad roots such as your home
+directory, `/`, `/Users`, and top-level home folders. If your shell is in a
+broad directory, use `cd /path/to/repo` first or pass `--project` explicitly:
+
+```bash
+pi-safe run --project /path/to/repo -- "review this code"
+```
+
 Inside a sandboxed Pi session, run:
 
 ```text
@@ -87,8 +96,9 @@ Inside a sandboxed Pi session, run:
 
 That command is explicitly loaded into the session by `pi-safe` and reports the
 active session id, real project path, staging path, sandbox profile, and
-safe-home. Already-open Pi sessions will not gain this command; start a new
-`pi` session after updating.
+safe-home as a visible `[pi-safe]` message. Active sessions also show a
+`pi-safe sandbox active` footer status after startup. Already-open Pi sessions
+will not gain this command; start a new `pi` session after updating.
 
 Use `run` when you want to choose a different project directory:
 
