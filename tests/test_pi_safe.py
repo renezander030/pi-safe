@@ -48,6 +48,12 @@ class PiSafeUnitTests(unittest.TestCase):
         with self.assertRaisesRegex(pi_safe.PiSafeError, "broad directory"):
             pi_safe.validate_project_root(pathlib.Path.home().resolve(), safe_home)
 
+    def test_validate_project_root_rejects_pi_config_directory(self):
+        safe_home = (ROOT / "tmp" / "safe-home").resolve()
+
+        with self.assertRaisesRegex(pi_safe.PiSafeError, "broad directory"):
+            pi_safe.validate_project_root(pathlib.Path.home().resolve() / ".pi", safe_home)
+
     def test_validate_project_root_rejects_safe_home_tree(self):
         safe_home = (ROOT / "tmp" / "safe-home").resolve()
 
@@ -121,7 +127,7 @@ class PiSafeUnitTests(unittest.TestCase):
         self.assertIn('"extensions": ["./src/index.ts"]', package_json.read_text(encoding="utf-8"))
         extension_source = index_ts.read_text(encoding="utf-8")
         self.assertIn('registerCommand("sandbox"', extension_source)
-        self.assertIn('ctx.ui.setStatus("pi-safe", "sandbox active")', extension_source)
+        self.assertIn('ctx.ui.setStatus("pi-safe", "pi-safe sandbox active")', extension_source)
         self.assertIn('pi.sendMessage({', extension_source)
 
     def test_pi_launch_args_load_session_status_extension_explicitly(self):

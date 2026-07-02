@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 MANIFEST = "pi-safe-session.json"
 PROFILE = "pi-safe.sb"
 DEFAULT_EXCLUDES = [".git", ".pi-safe", ".DS_Store"]
@@ -53,7 +53,7 @@ export default function (pi: any) {
   pi.on("session_start", async (_event: any, ctx: any) => {
     const status = sandboxStatus();
     if (status.active) {
-      ctx.ui.setStatus("pi-safe", "sandbox active");
+      ctx.ui.setStatus("pi-safe", "pi-safe sandbox active");
     }
   });
 
@@ -131,6 +131,7 @@ def unsafe_project_root_reason(project: Path, safe_home: Path) -> str | None:
         home / "Movies",
         home / "Music",
         home / "Pictures",
+        home / ".pi",
     }
 
     if project == root:
