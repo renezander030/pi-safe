@@ -109,6 +109,48 @@ class PiSafeUnitTests(unittest.TestCase):
         self.assertTrue((dest / "keep.txt").exists())
         self.assertFalse((dest / ".pi-safe-state").exists())
 
+    def test_safe_copytree_excludes_default_heavy_directories(self):
+        root = ROOT / "tmp" / f"pi-safe-copy-heavy-{uuid.uuid4().hex}"
+        project = root / "project"
+        dest = root / "copy"
+        (project / "src").mkdir(parents=True)
+        (project / ".venv" / "lib").mkdir(parents=True)
+        (project / "node_modules" / "pkg").mkdir(parents=True)
+        (project / "src" / "keep.py").write_text("print('keep')\n", encoding="utf-8")
+        (project / ".venv" / "lib" / "skip.py").write_text("skip\n", encoding="utf-8")
+        (project / "node_modules" / "pkg" / "skip.js").write_text("skip\n", encoding="utf-8")
+
+        pi_safe.safe_copytree(project, dest, pi_safe.DEFAULT_EXCLUDES)
+
+        self.assertTrue((dest / "src" / "keep.py").exists())
+        self.assertFalse((dest / ".venv").exists())
+        self.assertFalse((dest / "node_modules").exists())
+
+    def test_project_ignore_patterns_exclude_slashed_directories(self):
+        root = ROOT / "tmp" / f"pi-safe-copy-ignore-{uuid.uuid4().hex}"
+        project = root / "project"
+        dest = root / "copy"
+        (project / "src").mkdir(parents=True)
+        (project / "out").mkdir(parents=True)
+        (project / "nested" / "cache").mkdir(parents=True)
+        (project / "src" / "keep.py").write_text("print('keep')\n", encoding="utf-8")
+        (project / "out" / "skip.wav").write_text("skip\n", encoding="utf-8")
+        (project / "nested" / "cache" / "skip.txt").write_text("skip\n", encoding="utf-8")
+        (project / "debug.log").write_text("skip\n", encoding="utf-8")
+        (project / ".claudecodeignore").write_text(
+            "# generated files\n/out/\nnested/cache/\n*.log\n!ignored-negation\n",
+            encoding="utf-8",
+        )
+
+        excludes = pi_safe.DEFAULT_EXCLUDES + pi_safe.project_ignore_patterns(project)
+        pi_safe.safe_copytree(project, dest, excludes)
+
+        self.assertTrue((dest / "src" / "keep.py").exists())
+        self.assertTrue((dest / ".claudecodeignore").exists())
+        self.assertFalse((dest / "out").exists())
+        self.assertFalse((dest / "nested" / "cache").exists())
+        self.assertFalse((dest / "debug.log").exists())
+
     def test_session_status_extension_written(self):
         root = ROOT / "tmp" / f"pi-safe-extension-{uuid.uuid4().hex}"
         project = root / "project"

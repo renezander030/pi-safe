@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import difflib
+import fnmatch
 import hashlib
 import json
 import os
@@ -19,10 +20,49 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.1.7"
+VERSION = "0.1.8"
 MANIFEST = "pi-safe-session.json"
 PROFILE = "pi-safe.sb"
-DEFAULT_EXCLUDES = [".git", ".pi-safe", ".DS_Store"]
+DEFAULT_EXCLUDES = [
+    ".git",
+    ".pi-safe",
+    ".DS_Store",
+    ".env",
+    ".env.*",
+    ".venv",
+    "venv",
+    "env",
+    "node_modules",
+    "bower_components",
+    "jspm_packages",
+    "__pycache__",
+    "*.pyc",
+    "*.pyo",
+    ".cache",
+    ".tmp",
+    ".temp",
+    "tmp",
+    "temp",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    "coverage",
+    ".nyc_output",
+    "test-results",
+    "playwright-report",
+    "dist",
+    "build",
+    "target",
+    "out",
+    ".next",
+    ".nuxt",
+    ".turbo",
+    ".parcel-cache",
+    ".swc",
+    "*.log",
+]
+PROJECT_IGNORE_FILES = [".pi-safeignore", ".claudecodeignore"]
 TEXT_DIFF_MAX_BYTES = 1024 * 1024
 COMMANDS = {"run", "diff", "apply", "profile", "sessions", "selftest", "status", "help"}
 TOP_LEVEL_OPTIONS = {"--help", "-h", "--version"}
@@ -187,6 +227,40 @@ def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def normalize_ignore_pattern(raw: str) -> str | None:
+    pattern = raw.strip()
+    if not pattern or pattern.startswith("#") or pattern.startswith("!"):
+        return None
+    while pattern.startswith("./"):
+        pattern = pattern[2:]
+    pattern = pattern.strip("/")
+    return pattern or None
+
+
+def project_ignore_patterns(project: Path) -> list[str]:
+    patterns: list[str] = []
+    for name in PROJECT_IGNORE_FILES:
+        path = project / name
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            pattern = normalize_ignore_pattern(line)
+            if pattern:
+                patterns.append(pattern)
+    return patterns
+
+
+def should_ignore_path(rel: str, name: str, patterns: list[str]) -> bool:
+    rel = rel.strip("/")
+    for pattern in patterns:
+        if "/" in pattern:
+            if fnmatch.fnmatch(rel, pattern) or rel.startswith(pattern.rstrip("/") + "/"):
+                return True
+        elif fnmatch.fnmatch(name, pattern):
+            return True
+    return False
+
+
 def quote_sb(value: Path | str) -> str:
     raw = str(value)
     return '"' + raw.replace("\\", "\\\\").replace('"', '\\"') + '"'
@@ -215,14 +289,22 @@ def make_profile(staging: Path, writable: Path, allow_system_temp: bool = False)
 def safe_copytree(src: Path, dest: Path, excludes: list[str], exclude_paths: list[Path] | None = None) -> None:
     if dest.exists():
         raise PiSafeError(f"refusing to overwrite existing copy destination: {dest}")
-    pattern_ignore = shutil.ignore_patterns(*excludes) if excludes else None
+    patterns = [pattern for pattern in (normalize_ignore_pattern(item) for item in excludes) if pattern]
     exclude_roots = [path.resolve() for path in (exclude_paths or [])]
+    src_resolved = src.resolve()
 
     def ignore(dir_path: str, names: list[str]) -> set[str]:
-        ignored = set(pattern_ignore(dir_path, names) if pattern_ignore else [])
+        ignored: set[str] = set()
         current = Path(dir_path).resolve()
         for name in names:
             child = current / name
+            try:
+                rel = child.relative_to(src_resolved).as_posix()
+            except ValueError:
+                rel = name
+            if should_ignore_path(rel, name, patterns):
+                ignored.add(name)
+                continue
             if any(child == root or is_relative_to(child, root) for root in exclude_roots):
                 ignored.add(name)
         return ignored
@@ -590,7 +672,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     project = resolve_existing_dir(args.project, "project")
     safe_home = resolve_safe_home(args.safe_home)
     validate_project_root(project, safe_home)
-    excludes = DEFAULT_EXCLUDES + list(args.exclude or [])
+    excludes = DEFAULT_EXCLUDES + project_ignore_patterns(project) + list(args.exclude or [])
     session = create_session(project, safe_home, args.session, excludes, args.allow_system_temp)
     pi_cmd = find_pi(args.pi)
     if args.dry_run:
@@ -611,7 +693,7 @@ def cmd_diff(args: argparse.Namespace) -> int:
 def cmd_apply(args: argparse.Namespace) -> int:
     safe_home = resolve_safe_home(args.safe_home)
     session = load_session(safe_home, args.session)
-    excludes = DEFAULT_EXCLUDES + list(args.exclude or [])
+    excludes = DEFAULT_EXCLUDES + project_ignore_patterns(session.project) + list(args.exclude or [])
     return apply_changes(session, safe_home, args.yes, args.allow_symlinks, excludes)
 
 
