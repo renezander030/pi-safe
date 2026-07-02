@@ -4,6 +4,17 @@
 It runs Pi inside a copied staging workspace with a macOS Seatbelt profile so the
 real project stays read-only while the agent works.
 
+## Default `pi` Override On macOS
+
+When `bin/pi` is installed over the shell's default `pi` command, every normal
+`pi` launch starts through `pi-safe` first. The wrapper finds the real Pi CLI,
+creates a copied staging workspace, and runs Pi there under `/usr/bin/sandbox-exec`.
+The agent can write staging, but direct writes to the real project are blocked
+until you review and apply them with `pi-safe`.
+
+Use `pi /sandbox` before launch to verify the wrapper, and `/sandbox` inside Pi
+to verify the active sandbox session.
+
 This is harness-level protection: the model can ask to run tools, but the
 operating system blocks writes outside the staging/session directories.
 
@@ -31,18 +42,28 @@ cd pi-safe
 install -m 755 bin/pi-safe ~/.local/bin/pi-safe
 ```
 
-Optional transparent mode: install the `pi` wrapper ahead of the real Pi binary
-on your `PATH`. Then normal `pi ...` invocations run through `pi-safe`.
+Transparent default mode: install the `pi` wrapper as the command your shell
+finds first. Then normal `pi ...` invocations run through `pi-safe`.
 
 ```bash
 install -m 755 bin/pi ~/.local/bin/pi
 # ensure ~/.local/bin appears before /opt/homebrew/bin in PATH
 ```
 
-The wrapper discovers the next real `pi` binary on `PATH` and passes it to
-`pi-safe --pi`, avoiding recursion. Set `PI_SAFE_REAL_PI=/path/to/pi` if you
-want to pin the real binary, or `PI_SAFE_BYPASS=1` when you intentionally need
-to run Pi without the sandbox, for example:
+To overwrite the Homebrew `pi` command directly on macOS while preserving the
+upstream entrypoint:
+
+```bash
+install -m 755 bin/pi-safe /opt/homebrew/bin/pi-safe
+mv /opt/homebrew/bin/pi /opt/homebrew/bin/pi.homebrew-link
+install -m 755 bin/pi /opt/homebrew/bin/pi
+```
+
+The wrapper first uses known Homebrew/npm Pi CLI paths, then discovers the next
+real `pi` binary on `PATH` and passes it to `pi-safe --pi`, avoiding recursion.
+Set `PI_SAFE_REAL_PI=/path/to/pi` if you want to pin the real binary, or
+`PI_SAFE_BYPASS=1` when you intentionally need to run Pi without the sandbox,
+for example:
 
 ```bash
 PI_SAFE_BYPASS=1 pi --help
