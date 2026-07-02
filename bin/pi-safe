@@ -19,13 +19,14 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 MANIFEST = "pi-safe-session.json"
 PROFILE = "pi-safe.sb"
 DEFAULT_EXCLUDES = [".git", ".pi-safe", ".DS_Store"]
 TEXT_DIFF_MAX_BYTES = 1024 * 1024
 COMMANDS = {"run", "diff", "apply", "profile", "sessions", "selftest", "status", "help"}
 TOP_LEVEL_OPTIONS = {"--help", "-h", "--version"}
+PI_TRUST_FLAGS = {"--approve", "-a", "--no-approve", "-na"}
 SESSION_EXTENSION_PACKAGE = """{
   "name": "pi-safe-status",
   "version": "1.0.0",
@@ -241,8 +242,19 @@ def session_status_extension_path(session: Session) -> Path:
     return session.writable / "pi-agent" / "extensions" / "pi-safe-status" / "src" / "index.ts"
 
 
+def normalize_pi_args(pi_args: list[str]) -> list[str]:
+    if any(arg in PI_TRUST_FLAGS for arg in pi_args):
+        return pi_args
+    return ["--no-approve", *pi_args]
+
+
 def pi_launch_args(session: Session, pi_cmd: str, pi_args: list[str]) -> list[str]:
-    return [pi_cmd, "--extension", str(session_status_extension_path(session)), *pi_args]
+    return [
+        pi_cmd,
+        "--extension",
+        str(session_status_extension_path(session)),
+        *normalize_pi_args(pi_args),
+    ]
 
 
 def create_session(

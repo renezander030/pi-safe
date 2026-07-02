@@ -89,6 +89,12 @@ or pass `--project` explicitly:
 pi-safe run --project /path/to/repo -- "review this code"
 ```
 
+Sandboxing is the default. `pi-safe` passes `--no-approve` to Pi unless you
+explicitly pass `--approve` or `--no-approve` yourself. That suppresses Pi's
+project-trust prompt and avoids auto-running project-local packages or
+extensions from the copied repo while still loading the `pi-safe` status
+extension.
+
 Inside a sandboxed Pi session, run:
 
 ```text
