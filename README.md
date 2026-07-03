@@ -4,6 +4,8 @@
 It runs Pi inside a copied staging workspace with a macOS Seatbelt profile so the
 real project stays read-only while the agent works.
 
+![pi-safe running the Pi agent inside a sandboxed staging workspace, with staged diffs shown before anything reaches the real project](docs/pi-safe-demo.gif)
+
 ## Default `pi` Override On macOS
 
 When `bin/pi` is installed over the shell's default `pi` command, every normal
