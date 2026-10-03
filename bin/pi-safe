@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import difflib
+import fcntl
 import fnmatch
 import hashlib
 import json
@@ -17,6 +18,7 @@ import tempfile
 import textwrap
 import uuid
 from dataclasses import dataclass
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -65,7 +67,9 @@ DEFAULT_EXCLUDES = [
 ]
 PROJECT_IGNORE_FILES = [".pi-safeignore", ".claudecodeignore"]
 TEXT_DIFF_MAX_BYTES = 1024 * 1024
-COMMANDS = {"run", "diff", "apply", "profile", "sessions", "selftest", "status", "help"}
+COMMANDS = {"run", "diff", "apply", "profile", "sessions", "cleanup", "selftest", "status", "help"}
+COPY_WARNING_BYTES = 1024 ** 3
+STORAGE_WARNING_BYTES = 5 * 1024 ** 3
 TOP_LEVEL_OPTIONS = {"--help", "-h", "--version"}
 PI_TRUST_FLAGS = {"--approve", "-a", "--no-approve", "-na"}
 SESSION_EXTENSION_PACKAGE = """{
@@ -313,6 +317,95 @@ def safe_copytree(src: Path, dest: Path, excludes: list[str], exclude_paths: lis
     shutil.copytree(src, dest, symlinks=True, ignore=ignore)
 
 
+def copy_size(project: Path, excludes: list[str], safe_home: Path) -> int:
+    """Estimate one copy using the same exclusions, without following symlinks."""
+    patterns = [p for p in (normalize_ignore_pattern(x) for x in excludes) if p]
+    total = 0
+    def fail(error):
+        raise error
+    for current, dirs, files in os.walk(project, followlinks=False, onerror=fail):
+        parent = Path(current)
+        for name in dirs[:]:
+            child = parent / name
+            rel = child.relative_to(project).as_posix()
+            if should_ignore_path(rel, name, patterns) or is_relative_to(child, safe_home):
+                dirs.remove(name)
+            elif child.is_symlink():
+                dirs.remove(name)
+                total += child.lstat().st_size
+        for name in files:
+            child = parent / name
+            rel = child.relative_to(project).as_posix()
+            if not should_ignore_path(rel, name, patterns) and not is_relative_to(child, safe_home):
+                total += child.lstat().st_size
+    return total
+
+
+def tree_size(root: Path) -> int:
+    if not root.exists():
+        return 0
+    if root.is_symlink():
+        raise PiSafeError(f"refusing symlink storage directory: {root}")
+    return sum(path.lstat().st_size for path in iter_entries(root))
+
+
+def human_size(size: int) -> str:
+    return f"{size / (1024 ** 3):.2f} GiB" if size >= 1024 ** 3 else f"{size / (1024 ** 2):.2f} MiB"
+
+
+def session_root(safe_home: Path, session_id: str) -> Path:
+    if not session_id or session_id in {".", ".."} or Path(session_id).name != session_id:
+        raise PiSafeError(f"invalid session id: {session_id!r}")
+    sessions = safe_home / "sessions"
+    root = sessions / session_id
+    if sessions.is_symlink() or root.is_symlink():
+        raise PiSafeError(f"refusing symlink session path: {root}")
+    return root
+
+
+@contextmanager
+def session_lock(root: Path):
+    """Cooperate with run/apply/cleanup; keep the lock outside the sandbox's writable paths."""
+    fd = os.open(root / ".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise PiSafeError(f"session is active: {root.name}")
+        yield
+
+
+def session_data(root: Path) -> dict[str, Any]:
+    try:
+        if (root / MANIFEST).is_symlink():
+            return {}
+        data = read_json(root / MANIFEST)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def owner_alive(data: dict[str, Any]) -> bool:
+    if data.get("state") not in {"creating", "running"}:
+        return False
+    pid = data.get("pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def set_session_state(root: Path, state: str) -> None:
+    data = session_data(root)
+    data.update(state=state, pid=os.getpid() if state in {"creating", "running"} else None)
+    write_json(root / MANIFEST, data)
+
+
 def install_session_status_extension(session: Session) -> None:
     ext = session.writable / "pi-agent" / "extensions" / "pi-safe-status"
     src = ext / "src"
@@ -349,7 +442,7 @@ def create_session(
 ) -> Session:
     project_slug = project.name or "project"
     session_id = session_name or f"{now_slug()}-{project_slug}-{uuid.uuid4().hex[:8]}"
-    root = safe_home / "sessions" / session_id
+    root = session_root(safe_home, session_id)
     if root.exists():
         raise PiSafeError(f"session already exists: {session_id}")
 
@@ -357,40 +450,49 @@ def create_session(
     staging = root / "staging"
     writable = root / "writable"
     profile = root / PROFILE
-    ensure_dir(root)
-    ensure_dir(writable)
-    ensure_dir(writable / "home")
-    ensure_dir(writable / "tmp")
-    ensure_dir(writable / "pi-agent")
-    ensure_dir(writable / "pi-sessions")
-    ensure_dir(root / "logs")
-
-    safe_copytree(project, original, excludes, [safe_home])
-    safe_copytree(project, staging, excludes, [safe_home])
-    profile.write_text(make_profile(staging, writable, allow_system_temp), encoding="utf-8")
-
+    ensure_dir(root.parent)
+    root.mkdir()  # Claim the session name without overwriting a concurrent creator.
     session = Session(session_id, project, root, original, staging, writable, profile)
-    install_session_status_extension(session)
-    write_json(
-        root / MANIFEST,
-        {
-            "version": 1,
-            "sessionId": session_id,
-            "createdAt": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-            "project": str(project),
-            "original": str(original),
-            "staging": str(staging),
-            "writable": str(writable),
-            "profile": str(profile),
-            "excludes": excludes,
-            "allowSystemTemp": allow_system_temp,
-        },
-    )
+    with session_lock(root):
+        try:
+            write_json(root / MANIFEST, {
+                "version": 1,
+                "sessionId": session_id,
+                "createdAt": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+                "project": str(project),
+                "original": str(original),
+                "staging": str(staging),
+                "writable": str(writable),
+                "profile": str(profile),
+                "excludes": excludes,
+                "allowSystemTemp": allow_system_temp,
+                "state": "creating",
+                "pid": os.getpid(),
+            })
+            for path in [writable / "home", writable / "tmp", writable / "pi-agent", writable / "pi-sessions", root / "logs"]:
+                ensure_dir(path)
+            safe_copytree(project, original, excludes, [safe_home])
+            safe_copytree(project, staging, excludes, [safe_home])
+            profile.write_text(make_profile(staging, writable, allow_system_temp), encoding="utf-8")
+            install_session_status_extension(session)
+            set_session_state(root, "ready")
+        except BaseException:
+            # Creation has not launched Pi, so these are only disposable partial copies.
+            try:
+                set_session_state(root, "failed")
+                trash = find_trash()
+                if not trash:
+                    raise PiSafeError("trash is unavailable")
+                subprocess.run([trash, str(root)], check=True)
+                print(f"Failed session moved to Trash: {session_id}", file=sys.stderr)
+            except Exception as cleanup_error:
+                print(f"Partial session retained at {root}: {cleanup_error}. See `pi-safe sessions`.", file=sys.stderr)
+            raise
     return session
 
 
 def load_session(safe_home: Path, session_id: str) -> Session:
-    root = safe_home / "sessions" / session_id
+    root = session_root(safe_home, session_id)
     manifest_path = root / MANIFEST
     if not manifest_path.exists():
         raise PiSafeError(f"session not found: {session_id}")
@@ -659,13 +761,71 @@ def apply_changes(
 
 def list_sessions(safe_home: Path) -> int:
     sessions_dir = safe_home / "sessions"
+    if sessions_dir.is_symlink():
+        raise PiSafeError(f"refusing symlink session path: {sessions_dir}")
     if not sessions_dir.exists():
         print("No pi-safe sessions.")
         return 0
+    total = 0
     for entry in sorted(sessions_dir.iterdir()):
-        if (entry / MANIFEST).exists():
-            data = read_json(entry / MANIFEST)
-            print(f"{data['sessionId']}\t{data['project']}")
+        if entry.is_symlink() or not entry.is_dir():
+            print(f"{entry.name}\tunsafe entry (held back)")
+            continue
+        data = session_data(entry)
+        size = tree_size(entry)
+        total += size
+        state = data.get("state", "legacy" if data else "incomplete")
+        if state in {"creating", "running"} and not owner_alive(data):
+            state = "interrupted"
+        print(f"{entry.name}\t{data.get('project', '(unknown project)')}\t{human_size(size)}\t{state}")
+    print(f"Session storage: {human_size(total)} (logical file sizes; APFS sharing may reduce physical use).")
+    print("Review with `pi-safe diff ID`; preview cleanup with `pi-safe cleanup ID`.")
+    return 0
+
+
+def cleanup_guard(root: Path, discard_changes: bool) -> None:
+    data = session_data(root)
+    if owner_alive(data):
+        raise PiSafeError(f"session is active: {root.name}")
+    # Legacy sessions have no lifecycle PID/lock. Pi's extension/profile arguments
+    # include this path, also covering a child left alive after its launcher dies.
+    try:
+        commands = subprocess.check_output(["ps", "-axo", "command="], text=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise PiSafeError(f"cannot verify running processes for {root.name}: {exc}")
+    if str(root) + "/" in commands:
+        raise PiSafeError(f"session is active: {root.name}")
+    original, staging = root / "original", root / "staging"
+    complete = all(p.is_dir() and not p.is_symlink() for p in (original, staging))
+    if not discard_changes:
+        if not data or not complete or data.get("state") in {"creating", "failed"}:
+            raise PiSafeError(f"{root.name}: incomplete session; inspect it before using --discard-changes")
+        if change_set(original, staging):
+            raise PiSafeError(f"{root.name}: staged changes retained; review `pi-safe diff` before --discard-changes")
+
+
+def cmd_cleanup(args: argparse.Namespace) -> int:
+    safe_home = resolve_safe_home(args.safe_home)
+    roots = [session_root(safe_home, name) for name in dict.fromkeys(args.sessions)]
+    # Validate every target before moving any of them. Locks remain held through Trash.
+    with ExitStack() as locks:
+        for root in roots:
+            if not root.is_dir():
+                raise PiSafeError(f"session not found: {root.name}")
+            locks.enter_context(session_lock(root))
+            cleanup_guard(root, args.discard_changes)
+            print(f"To Trash: {root.name}\t{human_size(tree_size(root))}")
+        if not args.yes:
+            print("Preview only. Repeat with --yes to move these sessions to Trash (including their logs/history).")
+            return 0
+        trash = find_trash()
+        if not trash:
+            raise PiSafeError("trash is unavailable; no sessions moved")
+        for root in roots:
+            cleanup_guard(root, args.discard_changes)
+            subprocess.run([trash, str(root)], check=True)
+            print(f"Trashed: {root.name}")
+    print("Trash is recoverable and has not been emptied.")
     return 0
 
 
@@ -674,16 +834,37 @@ def cmd_run(args: argparse.Namespace) -> int:
     safe_home = resolve_safe_home(args.safe_home)
     validate_project_root(project, safe_home)
     excludes = DEFAULT_EXCLUDES + project_ignore_patterns(project) + list(args.exclude or [])
-    session = create_session(project, safe_home, args.session, excludes, args.allow_system_temp)
     pi_cmd = find_pi(args.pi)
+    estimate = 2 * copy_size(project, excludes, safe_home)
+    stored = tree_size(safe_home / "sessions")
+    print(f"Project copies: approximately {human_size(estimate)}; existing sessions: {human_size(stored)}.")
     if args.dry_run:
-        print(f"session: {session.session_id}")
-        print(f"staging: {session.staging}")
-        print(f"profile: {session.profile}")
+        session_id = args.session or f"{now_slug()}-{project.name}-{uuid.uuid4().hex[:8]}"
+        root = session_root(safe_home, session_id)
+        print("Preview only; no session or copies created.")
+        print(f"staging: {root / 'staging'}")
+        print(f"profile: {root / PROFILE}")
         print("command:")
+        session = Session(session_id, project, root, root / "original", root / "staging", root / "writable", root / PROFILE)
         print(" ".join([shutil.which("sandbox-exec") or "/usr/bin/sandbox-exec", "-f", str(session.profile), *pi_launch_args(session, pi_cmd, args.pi_args)]))
         return 0
-    return run_sandboxed_pi(session, pi_cmd, args.pi_args)
+    if not args.allow_large_copy and (estimate > COPY_WARNING_BYTES or stored + estimate > STORAGE_WARNING_BYTES):
+        raise PiSafeError("copy/storage budget exceeded (1 GiB per launch, 5 GiB total sessions). "
+                          "Exclude media with .pi-safeignore, review `pi-safe sessions` / `cleanup`, "
+                          "or explicitly use --allow-large-copy.")
+    ancestor = safe_home
+    while not ancestor.exists():
+        ancestor = ancestor.parent
+    if shutil.disk_usage(ancestor).free < estimate + 64 * 1024 ** 2:
+        raise PiSafeError("insufficient free space for two project copies plus a 64 MiB reserve")
+    session = create_session(project, safe_home, args.session, excludes, args.allow_system_temp)
+    with session_lock(session.root):
+        set_session_state(session.root, "running")
+        try:
+            return run_sandboxed_pi(session, pi_cmd, args.pi_args)
+        finally:
+            set_session_state(session.root, "finished")
+            print(f"Session retained: {session.session_id}. Review with `pi-safe diff`; use `pi-safe cleanup` when done.")
 
 
 def cmd_diff(args: argparse.Namespace) -> int:
@@ -695,7 +876,8 @@ def cmd_apply(args: argparse.Namespace) -> int:
     safe_home = resolve_safe_home(args.safe_home)
     session = load_session(safe_home, args.session)
     excludes = DEFAULT_EXCLUDES + project_ignore_patterns(session.project) + list(args.exclude or [])
-    return apply_changes(session, safe_home, args.yes, args.allow_symlinks, excludes)
+    with session_lock(session.root):
+        return apply_changes(session, safe_home, args.yes, args.allow_symlinks, excludes)
 
 
 def cmd_profile(args: argparse.Namespace) -> int:
@@ -824,7 +1006,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--pi", help="path to pi executable")
     run.add_argument("--exclude", action="append", help="additional copy exclude pattern")
     run.add_argument("--allow-system-temp", action="store_true", help="also allow writes to /tmp and /private/tmp")
-    run.add_argument("--dry-run", action="store_true", help="create session and print command without running pi")
+    run.add_argument("--dry-run", action="store_true", help="estimate copies and print command without creating a session")
+    run.add_argument("--allow-large-copy", action="store_true", help="allow copies above 1 GiB or total session storage above 5 GiB")
     run.add_argument("pi_args", nargs=argparse.REMAINDER, help="arguments passed to pi after --")
     run.set_defaults(func=cmd_run)
 
@@ -849,6 +1032,13 @@ def build_parser() -> argparse.ArgumentParser:
     sessions = sub.add_parser("sessions", help="list sessions")
     sessions.add_argument("--safe-home")
     sessions.set_defaults(func=lambda args: list_sessions(resolve_safe_home(args.safe_home)))
+
+    cleanup = sub.add_parser("cleanup", help="preview or trash explicitly named inactive sessions")
+    cleanup.add_argument("sessions", nargs="+")
+    cleanup.add_argument("--safe-home")
+    cleanup.add_argument("--yes", action="store_true", help="move named sessions to Trash, including logs/history")
+    cleanup.add_argument("--discard-changes", action="store_true", help="allow discarding reviewed staged changes or incomplete copies")
+    cleanup.set_defaults(func=cmd_cleanup)
 
     selftest = sub.add_parser("selftest", help="run destructive-attempt sandbox probes in a temp test tree")
     selftest.add_argument("--safe-home")
@@ -898,6 +1088,9 @@ def main(argv: list[str] | None = None) -> int:
     except subprocess.CalledProcessError as exc:
         print(f"pi-safe: command failed: {exc}", file=sys.stderr)
         return exc.returncode or 1
+    except OSError as exc:
+        print(f"pi-safe: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
