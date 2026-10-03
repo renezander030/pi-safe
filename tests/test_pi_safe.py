@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 import argparse
+import contextlib
+import io
 import importlib.machinery
 import pathlib
+import subprocess
 import uuid
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -219,6 +223,283 @@ class PiSafeUnitTests(unittest.TestCase):
         changes = pi_safe.change_set(original, staging)
         hazards = pi_safe.guard_apply(session, changes, allow_symlinks=False)
         self.assertTrue(any("symlink" in h for h in hazards))
+
+
+class SessionStorageTests(unittest.TestCase):
+    def setUp(self):
+        self.root = ROOT / "tmp" / f"storage-{uuid.uuid4().hex}"
+        self.project = self.root / "project"
+        self.project.mkdir(parents=True)
+        (self.project / "source.txt").write_text("original\n")
+        self.safe_home = self.root / "state"
+        processes = mock.patch.object(pi_safe.subprocess, "check_output", return_value="")
+        processes.start()
+        self.addCleanup(processes.stop)
+
+    def session(self, name="one"):
+        return pi_safe.create_session(self.project, self.safe_home, name, [], False)
+
+    def cleanup_args(self, *names, yes=False, discard=False):
+        return argparse.Namespace(safe_home=str(self.safe_home), sessions=list(names or ["one"]),
+                                  yes=yes, discard_changes=discard)
+
+    def fake_trash(self, command, **kwargs):
+        self.assertEqual(command[0], "/test/trash")
+        target = pathlib.Path(command[1])
+        dest = self.root / "trash" / target.name
+        dest.parent.mkdir(exist_ok=True)
+        target.rename(dest)
+        return subprocess.CompletedProcess(command, 0)
+
+    def run_args(self, *extra):
+        return pi_safe.build_parser().parse_args(["run", "--project", str(self.project),
+                                                "--safe-home", str(self.safe_home), "--pi", "/test/pi", *extra])
+
+    def test_copy_failure_is_discoverable_when_trash_unavailable(self):
+        real_copy = pi_safe.safe_copytree
+        calls = 0
+        def fail_second(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("copy interrupted")
+            return real_copy(*args, **kwargs)
+        with mock.patch.object(pi_safe, "safe_copytree", side_effect=fail_second), \
+             mock.patch.object(pi_safe, "find_trash", return_value=None):
+            with self.assertRaisesRegex(OSError, "copy interrupted"):
+                self.session()
+        root = self.safe_home / "sessions" / "one"
+        self.assertTrue((root / "original" / "source.txt").exists())
+        self.assertEqual(pi_safe.session_data(root)["state"], "failed")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            pi_safe.list_sessions(self.safe_home)
+        self.assertIn("one\t", out.getvalue())
+        self.assertIn("failed", out.getvalue())
+
+    def test_partial_copy_is_trashed_on_failure(self):
+        with mock.patch.object(pi_safe, "safe_copytree", side_effect=OSError("copy interrupted")), \
+             mock.patch.object(pi_safe, "find_trash", return_value="/test/trash"), \
+             mock.patch.object(pi_safe.subprocess, "run", side_effect=self.fake_trash):
+            with self.assertRaises(OSError):
+                self.session()
+        self.assertFalse((self.safe_home / "sessions" / "one").exists())
+        self.assertTrue((self.root / "trash" / "one" / pi_safe.MANIFEST).exists())
+        self.assertEqual((self.project / "source.txt").read_text(), "original\n")
+
+    def test_manifest_and_lock_exist_before_first_copy(self):
+        def inspect_then_interrupt(*args, **kwargs):
+            root = self.safe_home / "sessions" / "one"
+            self.assertEqual(pi_safe.session_data(root)["state"], "creating")
+            with self.assertRaisesRegex(pi_safe.PiSafeError, "active"):
+                pi_safe.cmd_cleanup(self.cleanup_args(yes=True, discard=True))
+            raise KeyboardInterrupt()
+        with mock.patch.object(pi_safe, "safe_copytree", side_effect=inspect_then_interrupt), \
+             mock.patch.object(pi_safe, "find_trash", return_value="/test/trash"), \
+             mock.patch.object(pi_safe.subprocess, "run", side_effect=self.fake_trash):
+            with self.assertRaises(KeyboardInterrupt):
+                self.session()
+        self.assertTrue((self.root / "trash" / "one" / pi_safe.MANIFEST).exists())
+
+    def test_unchanged_legacy_session_can_be_cleaned(self):
+        session = self.session()
+        data = pi_safe.session_data(session.root)
+        data.pop("state")
+        data.pop("pid")
+        pi_safe.write_json(session.root / pi_safe.MANIFEST, data)
+        with mock.patch.object(pi_safe, "find_trash", return_value="/test/trash"), \
+             mock.patch.object(pi_safe.subprocess, "run", side_effect=self.fake_trash):
+            pi_safe.cmd_cleanup(self.cleanup_args(yes=True))
+        self.assertFalse(session.root.exists())
+
+    def test_trash_failure_retains_failed_manifest(self):
+        with mock.patch.object(pi_safe, "safe_copytree", side_effect=OSError("copy interrupted")), \
+             mock.patch.object(pi_safe, "find_trash", return_value="/test/trash"), \
+             mock.patch.object(pi_safe.subprocess, "run", side_effect=subprocess.CalledProcessError(1, "trash")):
+            with self.assertRaises(OSError):
+                self.session()
+        self.assertEqual(pi_safe.session_data(self.safe_home / "sessions" / "one")["state"], "failed")
+
+    def test_session_list_includes_missing_and_corrupt_manifests(self):
+        for name in ["missing", "corrupt"]:
+            root = self.safe_home / "sessions" / name
+            root.mkdir(parents=True)
+            (root / "asset").write_bytes(b"x" * 1024)
+        (self.safe_home / "sessions" / "corrupt" / pi_safe.MANIFEST).write_text("{")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            pi_safe.list_sessions(self.safe_home)
+        self.assertIn("missing\t", out.getvalue())
+        self.assertIn("corrupt\t", out.getvalue())
+        self.assertIn("incomplete", out.getvalue())
+        self.assertIn("Session storage:", out.getvalue())
+
+    def test_cleanup_preview_preserves_session(self):
+        session = self.session()
+        with mock.patch.object(pi_safe.subprocess, "run") as trash:
+            self.assertEqual(pi_safe.cmd_cleanup(self.cleanup_args()), 0)
+            trash.assert_not_called()
+        self.assertTrue(session.root.exists())
+
+    def test_cleanup_only_trashes_named_session(self):
+        one = self.session()
+        two = self.session("two")
+        with mock.patch.object(pi_safe, "find_trash", return_value="/test/trash"), \
+             mock.patch.object(pi_safe.subprocess, "run", side_effect=self.fake_trash):
+            self.assertEqual(pi_safe.cmd_cleanup(self.cleanup_args(yes=True)), 0)
+        self.assertFalse(one.root.exists())
+        self.assertTrue(two.root.exists())
+        self.assertTrue((self.root / "trash" / "one" / "staging" / "source.txt").exists())
+        self.assertTrue((self.project / "source.txt").exists())
+
+    def test_cleanup_blocks_changed_session_even_with_yes(self):
+        session = self.session()
+        (session.staging / "source.txt").write_text("unapplied\n")
+        with mock.patch.object(pi_safe.subprocess, "run") as trash:
+            with self.assertRaisesRegex(pi_safe.PiSafeError, "staged changes retained"):
+                pi_safe.cmd_cleanup(self.cleanup_args(yes=True))
+            trash.assert_not_called()
+        self.assertTrue(session.root.exists())
+
+    def test_cleanup_can_explicitly_discard_changes(self):
+        session = self.session()
+        (session.staging / "source.txt").write_text("unapplied\n")
+        with mock.patch.object(pi_safe, "find_trash", return_value="/test/trash"), \
+             mock.patch.object(pi_safe.subprocess, "run", side_effect=self.fake_trash):
+            pi_safe.cmd_cleanup(self.cleanup_args(yes=True, discard=True))
+        self.assertEqual((self.root / "trash" / "one" / "staging" / "source.txt").read_text(), "unapplied\n")
+
+    def test_cleanup_incomplete_session_requires_discard(self):
+        root = self.safe_home / "sessions" / "one"
+        (root / "original").mkdir(parents=True)
+        with self.assertRaisesRegex(pi_safe.PiSafeError, "incomplete session"):
+            pi_safe.cmd_cleanup(self.cleanup_args(yes=True))
+        with mock.patch.object(pi_safe, "find_trash", return_value="/test/trash"), \
+             mock.patch.object(pi_safe.subprocess, "run", side_effect=self.fake_trash):
+            pi_safe.cmd_cleanup(self.cleanup_args(yes=True, discard=True))
+        self.assertTrue((self.root / "trash" / "one" / "original").exists())
+
+    def test_cleanup_never_overrides_running_session(self):
+        session = self.session()
+        pi_safe.set_session_state(session.root, "running")
+        with self.assertRaisesRegex(pi_safe.PiSafeError, "active"):
+            pi_safe.cmd_cleanup(self.cleanup_args(yes=True, discard=True))
+        self.assertTrue(session.root.exists())
+
+    def test_cleanup_blocks_live_legacy_agent(self):
+        session = self.session()
+        data = pi_safe.session_data(session.root)
+        data.pop("state")
+        data.pop("pid")
+        pi_safe.write_json(session.root / pi_safe.MANIFEST, data)
+        with mock.patch.object(pi_safe.subprocess, "check_output", return_value=f"pi --extension {session.writable}/extension.ts\n"):
+            with self.assertRaisesRegex(pi_safe.PiSafeError, "active"):
+                pi_safe.cmd_cleanup(self.cleanup_args(yes=True, discard=True))
+
+    def test_cleanup_holds_back_when_process_check_fails(self):
+        session = self.session()
+        with mock.patch.object(pi_safe.subprocess, "check_output", side_effect=OSError("ps denied")):
+            with self.assertRaisesRegex(pi_safe.PiSafeError, "cannot verify"):
+                pi_safe.cmd_cleanup(self.cleanup_args(yes=True, discard=True))
+        self.assertTrue(session.root.exists())
+
+    def test_session_list_does_not_follow_symlink_root(self):
+        self.safe_home.mkdir()
+        (self.safe_home / "sessions").symlink_to(self.project, target_is_directory=True)
+        with self.assertRaisesRegex(pi_safe.PiSafeError, "symlink"):
+            pi_safe.list_sessions(self.safe_home)
+
+    def test_cleanup_holds_back_locked_session(self):
+        session = self.session()
+        with pi_safe.session_lock(session.root):
+            with self.assertRaisesRegex(pi_safe.PiSafeError, "active"):
+                pi_safe.cmd_cleanup(self.cleanup_args(yes=True, discard=True))
+
+    def test_cleanup_validates_entire_batch_before_trash(self):
+        one = self.session()
+        two = self.session("two")
+        (two.staging / "source.txt").write_text("unapplied\n")
+        with mock.patch.object(pi_safe.subprocess, "run") as trash:
+            with self.assertRaises(pi_safe.PiSafeError):
+                pi_safe.cmd_cleanup(self.cleanup_args("one", "two", yes=True))
+            trash.assert_not_called()
+        self.assertTrue(one.root.exists())
+
+    def test_cleanup_does_not_follow_session_symlink(self):
+        (self.safe_home / "sessions").mkdir(parents=True)
+        (self.safe_home / "sessions" / "one").symlink_to(self.project, target_is_directory=True)
+        with self.assertRaisesRegex(pi_safe.PiSafeError, "symlink"):
+            pi_safe.cmd_cleanup(self.cleanup_args(yes=True, discard=True))
+        self.assertTrue(self.project.exists())
+
+    def test_session_ids_cannot_escape_sessions_root(self):
+        for name in ["..", "../project", str(self.project), ".", ""]:
+            with self.assertRaises(pi_safe.PiSafeError):
+                pi_safe.session_root(self.safe_home, name)
+
+    def test_cleanup_without_trash_has_no_delete_fallback(self):
+        session = self.session()
+        with mock.patch.object(pi_safe, "find_trash", return_value=None):
+            with self.assertRaisesRegex(pi_safe.PiSafeError, "trash is unavailable"):
+                pi_safe.cmd_cleanup(self.cleanup_args(yes=True))
+        self.assertTrue(session.root.exists())
+
+    def test_copy_estimate_respects_ignores_and_does_not_follow_links(self):
+        (self.project / "media").mkdir()
+        (self.project / "media" / "big.bin").write_bytes(b"x" * 8192)
+        (self.project / "linked-media").symlink_to(self.project / "media", target_is_directory=True)
+        state = self.project / ".state"
+        state.mkdir()
+        (state / "cached.bin").write_bytes(b"x" * 4096)
+        expected = (self.project / "source.txt").stat().st_size + (self.project / "linked-media").lstat().st_size
+        self.assertEqual(pi_safe.copy_size(self.project, ["media"], state), expected)
+
+    def test_dry_run_creates_no_session_tree(self):
+        with mock.patch.object(pi_safe, "create_session") as create:
+            self.assertEqual(pi_safe.cmd_run(self.run_args("--dry-run")), 0)
+            create.assert_not_called()
+        self.assertFalse(self.safe_home.exists())
+
+    def test_missing_pi_does_not_leave_session_copies(self):
+        with mock.patch.object(pi_safe, "find_pi", side_effect=pi_safe.PiSafeError("Pi missing")):
+            with self.assertRaisesRegex(pi_safe.PiSafeError, "Pi missing"):
+                pi_safe.cmd_run(self.run_args())
+        self.assertFalse(self.safe_home.exists())
+
+    def test_large_copy_is_blocked_before_creating_state(self):
+        with mock.patch.object(pi_safe, "COPY_WARNING_BYTES", 1):
+            with self.assertRaisesRegex(pi_safe.PiSafeError, "budget exceeded"):
+                pi_safe.cmd_run(self.run_args())
+        self.assertFalse(self.safe_home.exists())
+
+    def test_accumulated_storage_budget_is_enforced(self):
+        session = self.session()
+        with mock.patch.object(pi_safe, "STORAGE_WARNING_BYTES", 1):
+            with self.assertRaisesRegex(pi_safe.PiSafeError, "budget exceeded"):
+                pi_safe.cmd_run(self.run_args())
+        self.assertEqual(list(session.root.parent.iterdir()), [session.root])
+
+    def test_insufficient_space_is_blocked_before_creating_state(self):
+        with mock.patch.object(pi_safe.shutil, "disk_usage", return_value=argparse.Namespace(free=0)):
+            with self.assertRaisesRegex(pi_safe.PiSafeError, "insufficient free space"):
+                pi_safe.cmd_run(self.run_args("--allow-large-copy"))
+        self.assertFalse(self.safe_home.exists())
+
+    def test_allow_large_copy_launches_and_retains_finished_session(self):
+        with mock.patch.object(pi_safe, "COPY_WARNING_BYTES", 1), \
+             mock.patch.object(pi_safe, "run_sandboxed_pi", return_value=7):
+            self.assertEqual(pi_safe.cmd_run(self.run_args("--allow-large-copy", "--session", "one")), 7)
+        self.assertEqual(pi_safe.session_data(self.safe_home / "sessions" / "one")["state"], "finished")
+
+    def test_runner_failure_preserves_work_and_releases_lock(self):
+        with mock.patch.object(pi_safe, "run_sandboxed_pi", side_effect=OSError("runner failed")):
+            with self.assertRaises(OSError):
+                pi_safe.cmd_run(self.run_args("--session", "one"))
+        root = self.safe_home / "sessions" / "one"
+        self.assertTrue((root / "staging" / "source.txt").exists())
+        self.assertEqual(pi_safe.session_data(root)["state"], "finished")
+        with pi_safe.session_lock(root):
+            pass
 
 
 if __name__ == "__main__":

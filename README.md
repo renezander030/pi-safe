@@ -163,6 +163,57 @@ pi-safe profile SESSION_ID
 State defaults to `~/.pi-safe`. Override it with `--safe-home` or
 `PI_SAFE_HOME`.
 
+## Session Storage and Cleanup
+
+Sessions retain a baseline, a working copy, and their logs/history so that you
+can review work after Pi exits. They are **not automatically deleted**. Before
+each launch, pi-safe reports the estimated size of both copies and existing
+session storage. It stops before copying if a launch would exceed **1 GiB** of
+project copies or **5 GiB** of total session storage. These are logical file
+sizes; APFS clones can share physical disk blocks. The estimate respects
+`.pi-safeignore`, `.claudecodeignore`, default exclusions, and `--exclude`.
+
+Preview a launch without writing session files:
+
+```bash
+pi-safe run --project /path/to/repo --dry-run
+```
+
+For a media project, exclude assets the agent does not need with
+`.pi-safeignore`, or explicitly allow the larger copies:
+
+```bash
+pi-safe run --project /path/to/repo --allow-large-copy -- "review this code"
+```
+
+The override does not bypass the free-space check for two copies plus a 64 MiB
+reserve. Estimates cannot account for files growing while they are copied.
+
+`pi-safe sessions` lists sizes and lifecycle states, including old sessions,
+missing/corrupt manifests, and interrupted copies. Preview cleanup of specific
+session IDs, then confirm to move them to Trash:
+
+```bash
+pi-safe cleanup SESSION_ID
+pi-safe cleanup SESSION_ID --yes
+# Multiple IDs are supported; all are checked before any move:
+pi-safe cleanup SESSION_A SESSION_B --yes
+```
+
+Cleanup holds back active sessions, including recognizable running agents from
+older pi-safe versions. It also holds back staged changes and incomplete copies.
+After inspecting those files, use `--discard-changes` together with `--yes` to
+explicitly discard them. This moves the entire named session, including its
+logs/history, to Trash; it leaves real projects and apply snapshots untouched.
+Applied sessions still have a diff against their baseline and therefore require
+the same explicit override. Trash is never emptied by pi-safe.
+
+Creation records a manifest before copying. On a copy error or Ctrl-C before
+Pi launches, partial session copies go to Trash. If Trash is unavailable or fails,
+the partial session stays visible for later review. A killed process may also
+leave an interrupted session; no abandoned copies are silently hidden. Failures
+after Pi launches retain the workspace so you can recover its changes.
+
 ## Safety Model
 
 The real project is copied into two trees:
